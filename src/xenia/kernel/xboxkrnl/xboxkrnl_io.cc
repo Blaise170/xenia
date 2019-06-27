@@ -7,7 +7,6 @@
  ******************************************************************************
  */
 
-#include "xenia/xbox.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/memory.h"
 #include "xenia/cpu/processor.h"
@@ -19,72 +18,45 @@
 #include "xenia/kernel/xiocompletion.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/vfs/device.h"
+#include "xenia/xbox.h"
 
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
 
-// http://msdn.microsoft.com/en-us/library/windows/hardware/ff540287.aspx
-class X_FILE_FS_VOLUME_INFORMATION {
- public:
+// https://msdn.microsoft.com/en-us/library/windows/hardware/ff540287.aspx
+struct X_FILE_FS_VOLUME_INFORMATION {
   // FILE_FS_VOLUME_INFORMATION
-  uint64_t creation_time;
-  uint32_t serial_number;
-  uint32_t label_length;
-  uint32_t supports_objects;
+  xe::be<uint64_t> creation_time;
+  xe::be<uint32_t> serial_number;
+  xe::be<uint32_t> label_length;
+  xe::be<uint32_t> supports_objects;
   char label[1];
-
-  void Write(uint8_t* base, uint32_t p) {
-    uint8_t* dst = base + p;
-    xe::store_and_swap<uint64_t>(dst + 0, this->creation_time);
-    xe::store_and_swap<uint32_t>(dst + 8, this->serial_number);
-    xe::store_and_swap<uint32_t>(dst + 12, this->label_length);
-    xe::store_and_swap<uint32_t>(dst + 16, this->supports_objects);
-    memcpy(dst + 20, this->label, this->label_length);
-  }
 };
 static_assert_size(X_FILE_FS_VOLUME_INFORMATION, 24);
 
 // https://msdn.microsoft.com/en-us/library/windows/hardware/ff540282.aspx
-class X_FILE_FS_SIZE_INFORMATION {
- public:
+struct X_FILE_FS_SIZE_INFORMATION {
   // FILE_FS_SIZE_INFORMATION
-  uint64_t total_allocation_units;
-  uint64_t available_allocation_units;
-  uint32_t sectors_per_allocation_unit;
-  uint32_t bytes_per_sector;
-
-  void Write(uint8_t* base, uint32_t p) {
-    uint8_t* dst = base + p;
-    xe::store_and_swap<uint64_t>(dst + 0, this->total_allocation_units);
-    xe::store_and_swap<uint64_t>(dst + 8, this->available_allocation_units);
-    xe::store_and_swap<uint32_t>(dst + 16, this->sectors_per_allocation_unit);
-    xe::store_and_swap<uint32_t>(dst + 20, this->bytes_per_sector);
-  }
+  xe::be<uint64_t> total_allocation_units;
+  xe::be<uint64_t> available_allocation_units;
+  xe::be<uint32_t> sectors_per_allocation_unit;
+  xe::be<uint32_t> bytes_per_sector;
 };
 static_assert_size(X_FILE_FS_SIZE_INFORMATION, 24);
 
-// http://msdn.microsoft.com/en-us/library/windows/hardware/ff540251(v=vs.85).aspx
-class X_FILE_FS_ATTRIBUTE_INFORMATION {
- public:
+// https://msdn.microsoft.com/en-us/library/windows/hardware/ff540251(v=vs.85).aspx
+struct X_FILE_FS_ATTRIBUTE_INFORMATION {
   // FILE_FS_ATTRIBUTE_INFORMATION
-  uint32_t attributes;
-  int32_t maximum_component_name_length;
-  uint32_t fs_name_length;
+  xe::be<uint32_t> attributes;
+  xe::be<int32_t> maximum_component_name_length;
+  xe::be<uint32_t> fs_name_length;
   char fs_name[1];
-
-  void Write(uint8_t* base, uint32_t p) {
-    uint8_t* dst = base + p;
-    xe::store_and_swap<uint32_t>(dst + 0, this->attributes);
-    xe::store_and_swap<uint32_t>(dst + 4, this->maximum_component_name_length);
-    xe::store_and_swap<uint32_t>(dst + 8, this->fs_name_length);
-    memcpy(dst + 12, this->fs_name, this->fs_name_length);
-  }
 };
 static_assert_size(X_FILE_FS_ATTRIBUTE_INFORMATION, 16);
 
 struct CreateOptions {
-  // http://processhacker.sourceforge.net/doc/ntioapi_8h.html
+  // https://processhacker.sourceforge.io/doc/ntioapi_8h.html
   static const uint32_t FILE_DIRECTORY_FILE = 0x00000001;
   // Optimization - files access will be sequential, not random.
   static const uint32_t FILE_SEQUENTIAL_ONLY = 0x00000004;
@@ -161,7 +133,7 @@ dword_result_t NtCreateFile(lpdword_t handle_out, dword_t desired_access,
 
   return result;
 }
-DECLARE_XBOXKRNL_EXPORT(NtCreateFile, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT1(NtCreateFile, kFileSystem, kImplemented);
 
 dword_result_t NtOpenFile(lpdword_t handle_out, dword_t desired_access,
                           pointer_t<X_OBJECT_ATTRIBUTES> object_attributes,
@@ -172,7 +144,7 @@ dword_result_t NtOpenFile(lpdword_t handle_out, dword_t desired_access,
                       static_cast<uint32_t>(xe::vfs::FileDisposition::kOpen),
                       open_options);
 }
-DECLARE_XBOXKRNL_EXPORT(NtOpenFile, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT1(NtOpenFile, kFileSystem, kImplemented);
 
 dword_result_t NtReadFile(dword_t file_handle, dword_t event_handle,
                           lpvoid_t apc_routine_ptr, lpvoid_t apc_context,
@@ -194,6 +166,14 @@ dword_result_t NtReadFile(dword_t file_handle, dword_t event_handle,
 
   if (XSUCCEEDED(result)) {
     if (true || file->is_synchronous()) {
+      // some games NtReadFile() directly into texture memory
+      // TODO(rick): better checking of physical address
+      if (buffer.guest_address() >= 0xA0000000) {
+        auto heap = kernel_memory()->LookupHeap(buffer.guest_address());
+        cpu::MMIOHandler::global_handler()->InvalidateRange(
+            heap->GetPhysicalAddress(buffer.guest_address()), buffer_length);
+      }
+
       // Synchronous.
       size_t bytes_read = 0;
       result = file->Read(
@@ -255,7 +235,7 @@ dword_result_t NtReadFile(dword_t file_handle, dword_t event_handle,
 
   return result;
 }
-DECLARE_XBOXKRNL_EXPORT(NtReadFile, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT2(NtReadFile, kFileSystem, kImplemented, kHighFrequency);
 
 dword_result_t NtWriteFile(dword_t file_handle, dword_t event_handle,
                            function_t apc_routine, lpvoid_t apc_context,
@@ -330,7 +310,7 @@ dword_result_t NtWriteFile(dword_t file_handle, dword_t event_handle,
 
   return result;
 }
-DECLARE_XBOXKRNL_EXPORT(NtWriteFile, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT1(NtWriteFile, kFileSystem, kImplemented);
 
 dword_result_t NtCreateIoCompletion(lpdword_t out_handle,
                                     dword_t desired_access,
@@ -343,7 +323,7 @@ dword_result_t NtCreateIoCompletion(lpdword_t out_handle,
 
   return X_STATUS_SUCCESS;
 }
-DECLARE_XBOXKRNL_EXPORT(NtCreateIoCompletion, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT1(NtCreateIoCompletion, kFileSystem, kImplemented);
 
 // Dequeues a packet from the completion port.
 dword_result_t NtRemoveIoCompletion(
@@ -359,8 +339,8 @@ dword_result_t NtRemoveIoCompletion(
   }
 
   uint64_t timeout_ticks = timeout ? static_cast<uint32_t>(*timeout) : 0u;
-  if (port->WaitForNotification(timeout_ticks)) {
-    auto notification = port->DequeueNotification();
+  XIOCompletion::IONotification notification;
+  if (port->WaitForNotification(timeout_ticks, &notification)) {
     if (key_context) {
       *key_context = notification.key_context;
     }
@@ -378,7 +358,7 @@ dword_result_t NtRemoveIoCompletion(
 
   return status;
 }
-DECLARE_XBOXKRNL_EXPORT(NtRemoveIoCompletion, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT1(NtRemoveIoCompletion, kFileSystem, kImplemented);
 
 dword_result_t NtSetInformationFile(
     dword_t file_handle, pointer_t<X_IO_STATUS_BLOCK> io_status_block,
@@ -412,11 +392,16 @@ dword_result_t NtSetInformationFile(
         file->set_position(xe::load_and_swap<uint64_t>(file_info));
         break;
       case XFileAllocationInformation:
-      case XFileEndOfFileInformation:
         assert_true(length == 8);
         info = 8;
-        XELOGW("NtSetInformationFile ignoring alloc/eof");
+        XELOGW("NtSetInformationFile ignoring alloc");
         break;
+      case XFileEndOfFileInformation: {
+        assert_true(length == 8);
+        auto eof = xe::load_and_swap<uint64_t>(file_info);
+        result = file->SetLength(eof);
+        break;
+      }
       case XFileCompletionInformation: {
         // Info contains IO Completion handle and completion key
         assert_true(length == 8);
@@ -448,7 +433,8 @@ dword_result_t NtSetInformationFile(
 
   return result;
 }
-DECLARE_XBOXKRNL_EXPORT(NtSetInformationFile, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT2(NtSetInformationFile, kFileSystem, kImplemented,
+                         kHighFrequency);
 
 struct X_IO_STATUS_BLOCK {
   union {
@@ -563,8 +549,7 @@ dword_result_t NtQueryInformationFile(
 
   return result;
 }
-DECLARE_XBOXKRNL_EXPORT(NtQueryInformationFile,
-                        ExportTag::kImplemented | ExportTag::kFileSystem);
+DECLARE_XBOXKRNL_EXPORT1(NtQueryInformationFile, kFileSystem, kImplemented);
 
 dword_result_t NtQueryFullAttributesFile(
     pointer_t<X_OBJECT_ATTRIBUTES> obj_attribs,
@@ -600,61 +585,53 @@ dword_result_t NtQueryFullAttributesFile(
 
   return X_STATUS_NO_SUCH_FILE;
 }
-DECLARE_XBOXKRNL_EXPORT(NtQueryFullAttributesFile, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT1(NtQueryFullAttributesFile, kFileSystem, kImplemented);
 
-SHIM_CALL NtQueryVolumeInformationFile_shim(PPCContext* ppc_context,
-                                            KernelState* kernel_state) {
-  uint32_t file_handle = SHIM_GET_ARG_32(0);
-  uint32_t io_status_block_ptr = SHIM_GET_ARG_32(1);
-  uint32_t fs_info_ptr = SHIM_GET_ARG_32(2);
-  uint32_t length = SHIM_GET_ARG_32(3);
-  uint32_t fs_info_class = SHIM_GET_ARG_32(4);
-
-  XELOGD("NtQueryVolumeInformationFile(%.8X, %.8X, %.8X, %.8X, %.8X)",
-         file_handle, io_status_block_ptr, fs_info_ptr, length, fs_info_class);
-
+dword_result_t NtQueryVolumeInformationFile(
+    dword_t file_handle, pointer_t<X_IO_STATUS_BLOCK> io_status_block_ptr,
+    lpvoid_t fs_info_ptr, dword_t length, dword_t fs_info_class) {
   X_STATUS result = X_STATUS_SUCCESS;
   uint32_t info = 0;
 
   // Grab file.
-  auto file = kernel_state->object_table()->LookupObject<XFile>(file_handle);
+  auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
   if (file) {
     switch (fs_info_class) {
       case 1: {  // FileFsVolumeInformation
         // TODO(gibbed): actual value
         std::string name = "test";
-        X_FILE_FS_VOLUME_INFORMATION volume_info = {0};
-        volume_info.creation_time = 0;
-        volume_info.serial_number = 12345678;
-        volume_info.supports_objects = 0;
-        volume_info.label_length = uint32_t(name.size());
-        std::memcpy(volume_info.label, name.data(), name.size());
-        volume_info.Write(SHIM_MEM_BASE, fs_info_ptr);
+        X_FILE_FS_VOLUME_INFORMATION* volume_info =
+            fs_info_ptr.as<X_FILE_FS_VOLUME_INFORMATION*>();
+        volume_info->creation_time = 0;
+        volume_info->serial_number = 12345678;
+        volume_info->supports_objects = 0;
+        volume_info->label_length = uint32_t(name.size());
+        std::memcpy(volume_info->label, name.data(), name.size());
         info = length;
         break;
       }
       case 3: {  // FileFsSizeInformation
-        X_FILE_FS_SIZE_INFORMATION fs_size_info = {0};
-        fs_size_info.total_allocation_units =
+        X_FILE_FS_SIZE_INFORMATION* fs_size_info =
+            fs_info_ptr.as<X_FILE_FS_SIZE_INFORMATION*>();
+        fs_size_info->total_allocation_units =
             file->device()->total_allocation_units();
-        fs_size_info.available_allocation_units =
+        fs_size_info->available_allocation_units =
             file->device()->available_allocation_units();
-        fs_size_info.sectors_per_allocation_unit =
+        fs_size_info->sectors_per_allocation_unit =
             file->device()->sectors_per_allocation_unit();
-        fs_size_info.bytes_per_sector = file->device()->bytes_per_sector();
-        fs_size_info.Write(SHIM_MEM_BASE, fs_info_ptr);
+        fs_size_info->bytes_per_sector = file->device()->bytes_per_sector();
         info = length;
         break;
       }
       case 5: {  // FileFsAttributeInformation
         // TODO(gibbed): actual value
         std::string name = "test";
-        X_FILE_FS_ATTRIBUTE_INFORMATION fs_attribute_info = {0};
-        fs_attribute_info.attributes = 0;
-        fs_attribute_info.maximum_component_name_length = 255;
-        fs_attribute_info.fs_name_length = uint32_t(name.size());
-        std::memcpy(fs_attribute_info.fs_name, name.data(), name.size());
-        fs_attribute_info.Write(SHIM_MEM_BASE, fs_info_ptr);
+        X_FILE_FS_ATTRIBUTE_INFORMATION* fs_attribute_info =
+            fs_info_ptr.as<X_FILE_FS_ATTRIBUTE_INFORMATION*>();
+        fs_attribute_info->attributes = 0;
+        fs_attribute_info->maximum_component_name_length = 255;
+        fs_attribute_info->fs_name_length = uint32_t(name.size());
+        std::memcpy(fs_attribute_info->fs_name, name.data(), name.size());
         info = length;
         break;
       }
@@ -677,12 +654,14 @@ SHIM_CALL NtQueryVolumeInformationFile_shim(PPCContext* ppc_context,
     info = 0;
   }
   if (io_status_block_ptr) {
-    SHIM_SET_MEM_32(io_status_block_ptr, result);    // Status
-    SHIM_SET_MEM_32(io_status_block_ptr + 4, info);  // Information
+    io_status_block_ptr->status = result;
+    io_status_block_ptr->information = info;
   }
 
-  SHIM_SET_RETURN_32(result);
+  return result;
 }
+DECLARE_XBOXKRNL_EXPORT1(NtQueryVolumeInformationFile, kFileSystem,
+                         kImplemented);
 
 dword_result_t NtQueryDirectoryFile(
     dword_t file_handle, dword_t event_handle, function_t apc_routine,
@@ -722,47 +701,33 @@ dword_result_t NtQueryDirectoryFile(
 
   return result;
 }
-DECLARE_XBOXKRNL_EXPORT(NtQueryDirectoryFile, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT1(NtQueryDirectoryFile, kFileSystem, kImplemented);
 
-SHIM_CALL NtFlushBuffersFile_shim(PPCContext* ppc_context,
-                                  KernelState* kernel_state) {
-  uint32_t file_handle = SHIM_GET_ARG_32(0);
-  uint32_t io_status_block_ptr = SHIM_GET_ARG_32(1);
-
-  XELOGD("NtFlushBuffersFile(%.8X, %.8X)", file_handle, io_status_block_ptr);
-
+dword_result_t NtFlushBuffersFile(
+    dword_t file_handle, pointer_t<X_IO_STATUS_BLOCK> io_status_block_ptr) {
   auto result = X_STATUS_SUCCESS;
 
   if (io_status_block_ptr) {
-    SHIM_SET_MEM_32(io_status_block_ptr, result);  // Status
-    SHIM_SET_MEM_32(io_status_block_ptr + 4, 0);   // Information
+    io_status_block_ptr->status = result;
+    io_status_block_ptr->information = 0;
   }
 
-  SHIM_SET_RETURN_32(result);
+  return result;
 }
+DECLARE_XBOXKRNL_EXPORT1(NtFlushBuffersFile, kFileSystem, kStub);
 
 dword_result_t FscGetCacheElementCount(dword_t r3) { return 0; }
-DECLARE_XBOXKRNL_EXPORT(FscGetCacheElementCount, ExportTag::kStub);
+DECLARE_XBOXKRNL_EXPORT1(FscGetCacheElementCount, kFileSystem, kStub);
 
-SHIM_CALL FscSetCacheElementCount_shim(PPCContext* ppc_context,
-                                       KernelState* kernel_state) {
-  uint32_t unk_0 = SHIM_GET_ARG_32(0);
-  uint32_t unk_1 = SHIM_GET_ARG_32(1);
+dword_result_t FscSetCacheElementCount(dword_t unk_0, dword_t unk_1) {
   // unk_0 = 0
   // unk_1 looks like a count? in what units? 256 is a common value
-
-  XELOGD("FscSetCacheElementCount(%.8X, %.8X)", unk_0, unk_1);
-
-  SHIM_SET_RETURN_32(X_STATUS_SUCCESS);
+  return X_STATUS_SUCCESS;
 }
+DECLARE_XBOXKRNL_EXPORT1(FscSetCacheElementCount, kFileSystem, kStub);
 
 void RegisterIoExports(xe::cpu::ExportResolver* export_resolver,
-                       KernelState* kernel_state) {
-  SHIM_SET_MAPPING("xboxkrnl.exe", NtQueryVolumeInformationFile, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", NtFlushBuffersFile, state);
-
-  SHIM_SET_MAPPING("xboxkrnl.exe", FscSetCacheElementCount, state);
-}
+                       KernelState* kernel_state) {}
 
 }  // namespace xboxkrnl
 }  // namespace kernel

@@ -7,7 +7,6 @@
  ******************************************************************************
  */
 
-#include "xenia/xbox.h"
 #include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -15,13 +14,15 @@
 #include "xenia/kernel/xobject.h"
 #include "xenia/kernel/xsemaphore.h"
 #include "xenia/kernel/xthread.h"
+#include "xenia/xbox.h"
 
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
 
-SHIM_CALL ObOpenObjectByName_shim(PPCContext* ppc_context,
-                                  KernelState* kernel_state) {
+dword_result_t ObOpenObjectByName(lpunknown_t obj_attributes_ptr,
+                                  lpunknown_t object_type_ptr, dword_t unk,
+                                  lpdword_t handle_ptr) {
   // r3 = ptr to info?
   //   +0 = -4
   //   +4 = name ptr
@@ -29,26 +30,21 @@ SHIM_CALL ObOpenObjectByName_shim(PPCContext* ppc_context,
   // r4 = ExEventObjectType | ExSemaphoreObjectType | ExTimerObjectType
   // r5 = 0
   // r6 = out_ptr (handle?)
-  uint32_t obj_attributes_ptr = SHIM_GET_ARG_32(0);
-  uint32_t object_type_ptr = SHIM_GET_ARG_32(1);
-  uint32_t unk = SHIM_GET_ARG_32(2);
-  uint32_t handle_ptr = SHIM_GET_ARG_32(3);
 
   auto name =
-      X_ANSI_STRING::to_string_indirect(SHIM_MEM_BASE, obj_attributes_ptr + 4);
-
-  XELOGD("ObOpenObjectByName(%.8X(name=%s), %.8X, %.8X, %.8X)",
-         obj_attributes_ptr, name.c_str(), object_type_ptr, unk, handle_ptr);
+      X_ANSI_STRING::to_string_indirect(kernel_memory()->virtual_membase(),
+                                        obj_attributes_ptr.guest_address() + 4);
 
   X_HANDLE handle = X_INVALID_HANDLE_VALUE;
   X_STATUS result =
-      kernel_state->object_table()->GetObjectByName(name, &handle);
+      kernel_state()->object_table()->GetObjectByName(name, &handle);
   if (XSUCCEEDED(result)) {
-    SHIM_SET_MEM_32(handle_ptr, handle);
+    *handle_ptr = handle;
   }
 
-  SHIM_SET_RETURN_32(result);
+  return result;
 }
+DECLARE_XBOXKRNL_EXPORT1(ObOpenObjectByName, kNone, kImplemented);
 
 dword_result_t ObOpenObjectByPointer(lpvoid_t object_ptr,
                                      lpdword_t out_handle_ptr) {
@@ -62,7 +58,7 @@ dword_result_t ObOpenObjectByPointer(lpvoid_t object_ptr,
   *out_handle_ptr = object->handle();
   return X_STATUS_SUCCESS;
 }
-DECLARE_XBOXKRNL_EXPORT(ObOpenObjectByPointer, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT1(ObOpenObjectByPointer, kNone, kImplemented);
 
 dword_result_t ObLookupThreadByThreadId(dword_t thread_id,
                                         lpdword_t out_object_ptr) {
@@ -76,20 +72,14 @@ dword_result_t ObLookupThreadByThreadId(dword_t thread_id,
   *out_object_ptr = thread->guest_object();
   return X_STATUS_SUCCESS;
 }
-DECLARE_XBOXKRNL_EXPORT(ObLookupThreadByThreadId, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT1(ObLookupThreadByThreadId, kNone, kImplemented);
 
-SHIM_CALL ObReferenceObjectByHandle_shim(PPCContext* ppc_context,
-                                         KernelState* kernel_state) {
-  uint32_t handle = SHIM_GET_ARG_32(0);
-  uint32_t object_type_ptr = SHIM_GET_ARG_32(1);
-  uint32_t out_object_ptr = SHIM_GET_ARG_32(2);
-
-  XELOGD("ObReferenceObjectByHandle(%.8X, %.8X, %.8X)", handle, object_type_ptr,
-         out_object_ptr);
-
+dword_result_t ObReferenceObjectByHandle(dword_t handle,
+                                         dword_t object_type_ptr,
+                                         lpdword_t out_object_ptr) {
   X_STATUS result = X_STATUS_SUCCESS;
 
-  auto object = kernel_state->object_table()->LookupObject<XObject>(handle);
+  auto object = kernel_state()->object_table()->LookupObject<XObject>(handle);
   if (object) {
     // TODO(benvanik): verify type with object_type_ptr
 
@@ -119,6 +109,11 @@ SHIM_CALL ObReferenceObjectByHandle_shim(PPCContext* ppc_context,
           } break;
         }
       } break;
+      case 0xD00EBEEF: {  // ExEventObjectType
+        assert(object->type() == XObject::kTypeEvent);
+        native_ptr = object->guest_object();
+        assert_not_zero(native_ptr);
+      } break;
       case 0xD017BEEF: {  // ExSemaphoreObjectType
         assert(object->type() == XObject::kTypeSemaphore);
         native_ptr = object->guest_object();
@@ -138,36 +133,47 @@ SHIM_CALL ObReferenceObjectByHandle_shim(PPCContext* ppc_context,
     // Caller takes the reference.
     // It's released in ObDereferenceObject.
     object->Retain();
-    if (out_object_ptr) {
-      SHIM_SET_MEM_32(out_object_ptr, native_ptr);
+    if (out_object_ptr.guest_address()) {
+      *out_object_ptr = native_ptr;
     }
   } else {
     result = X_STATUS_INVALID_HANDLE;
   }
 
-  SHIM_SET_RETURN_32(result);
+  return result;
 }
+DECLARE_XBOXKRNL_EXPORT1(ObReferenceObjectByHandle, kNone, kImplemented);
 
-SHIM_CALL ObDereferenceObject_shim(PPCContext* ppc_context,
-                                   KernelState* kernel_state) {
-  uint32_t native_ptr = SHIM_GET_ARG_32(0);
-
-  XELOGD("ObDereferenceObject(%.8X)", native_ptr);
-
-  // Check if a dummy value from ObReferenceObjectByHandle.
-  if (native_ptr == 0xDEADF00D) {
-    SHIM_SET_RETURN_32(0);
-    return;
+dword_result_t ObReferenceObjectByName(lpstring_t name, dword_t attributes,
+                                       dword_t object_type_ptr,
+                                       lpvoid_t parse_context,
+                                       lpdword_t out_object_ptr) {
+  X_HANDLE handle = X_INVALID_HANDLE_VALUE;
+  X_STATUS result =
+      kernel_state()->object_table()->GetObjectByName(name.value(), &handle);
+  if (XSUCCEEDED(result)) {
+    return ObReferenceObjectByHandle(handle, object_type_ptr, out_object_ptr);
   }
 
-  void* object_ptr = SHIM_MEM_ADDR(native_ptr);
-  auto object = XObject::GetNativeObject<XObject>(kernel_state, object_ptr);
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT1(ObReferenceObjectByName, kNone, kImplemented);
+
+dword_result_t ObDereferenceObject(dword_t native_ptr) {
+  // Check if a dummy value from ObReferenceObjectByHandle.
+  if (native_ptr == 0xDEADF00D) {
+    return 0;
+  }
+
+  auto object = XObject::GetNativeObject<XObject>(
+      kernel_state(), kernel_memory()->virtual_membase() + native_ptr);
   if (object) {
     object->Release();
   }
 
-  SHIM_SET_RETURN_32(0);
+  return 0;
 }
+DECLARE_XBOXKRNL_EXPORT1(ObDereferenceObject, kNone, kImplemented);
 
 dword_result_t ObCreateSymbolicLink(pointer_t<X_ANSI_STRING> path,
                                     pointer_t<X_ANSI_STRING> target) {
@@ -188,7 +194,7 @@ dword_result_t ObCreateSymbolicLink(pointer_t<X_ANSI_STRING> path,
 
   return X_STATUS_SUCCESS;
 }
-DECLARE_XBOXKRNL_EXPORT(ObCreateSymbolicLink, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT1(ObCreateSymbolicLink, kNone, kImplemented);
 
 dword_result_t ObDeleteSymbolicLink(pointer_t<X_ANSI_STRING> path) {
   auto path_str = path->to_string(kernel_memory()->virtual_membase());
@@ -198,7 +204,7 @@ dword_result_t ObDeleteSymbolicLink(pointer_t<X_ANSI_STRING> path) {
 
   return X_STATUS_SUCCESS;
 }
-DECLARE_XBOXKRNL_EXPORT(ObDeleteSymbolicLink, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT1(ObDeleteSymbolicLink, kNone, kImplemented);
 
 dword_result_t NtDuplicateObject(dword_t handle, lpdword_t new_handle_ptr,
                                  dword_t options) {
@@ -223,19 +229,15 @@ dword_result_t NtDuplicateObject(dword_t handle, lpdword_t new_handle_ptr,
 
   return result;
 }
-DECLARE_XBOXKRNL_EXPORT(NtDuplicateObject, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT1(NtDuplicateObject, kNone, kImplemented);
 
 dword_result_t NtClose(dword_t handle) {
   return kernel_state()->object_table()->ReleaseHandle(handle);
 }
-DECLARE_XBOXKRNL_EXPORT(NtClose, ExportTag::kImplemented);
+DECLARE_XBOXKRNL_EXPORT1(NtClose, kNone, kImplemented);
 
 void RegisterObExports(xe::cpu::ExportResolver* export_resolver,
-                       KernelState* kernel_state) {
-  SHIM_SET_MAPPING("xboxkrnl.exe", ObOpenObjectByName, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", ObReferenceObjectByHandle, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", ObDereferenceObject, state);
-}
+                       KernelState* kernel_state) {}
 
 }  // namespace xboxkrnl
 }  // namespace kernel

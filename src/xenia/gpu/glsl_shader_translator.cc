@@ -131,8 +131,8 @@ struct VertexData {
 };
 )");
 
-  // http://www.nvidia.com/object/cube_map_ogl_tutorial.html
-  // http://developer.amd.com/wordpress/media/2012/10/R600_Instruction_Set_Architecture.pdf
+  // https://www.nvidia.com/object/cube_map_ogl_tutorial.html
+  // https://developer.amd.com/wordpress/media/2012/10/R600_Instruction_Set_Architecture.pdf
   // src0 = Rn.zzxy, src1 = Rn.yxzz
   // dst.W = FaceId;
   // dst.Z = 2.0f * MajorAxis;
@@ -179,7 +179,7 @@ vec4 cube(vec4 src0, vec4 src1) {
   float s = (sc / ma + 1.0) / 2.0;
   float t = (tc / ma + 1.0) / 2.0;
   return vec4(t, s, 2.0 * ma, float(face_id));
-};
+}
 )");
 
   if (is_vertex_shader()) {
@@ -234,7 +234,7 @@ vec4 applyTransform(const in StateData state, vec4 pos) {
   pos.xyz = mix(pos.xyz, pos.xyz / pos.w, notEqual(state.vtx_fmt.xyz, vec3(0.0)));
   pos.xy *= state.window_scale.xy;
   return pos;
-};
+}
 void processVertex(const in StateData state);
 void main() {
   gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
@@ -360,7 +360,8 @@ void main() {
     // May need a usage map?
     for (int i = 0; i < kMaxInterpolators; i++) {
       EmitSource(
-          "    r[%d] = mix(r[%d], ps_param_gen, state.ps_param_gen == %d);\n",
+          "    r[%d] = mix(r[%d], ps_param_gen, bvec4(state.ps_param_gen == "
+          "%d));\n",
           i, i, i);
     }
 
@@ -395,7 +396,7 @@ void GlslShaderTranslator::ProcessLabel(uint32_t cf_index) {
   }
 }
 
-void GlslShaderTranslator::ProcessControlFlowNopInstruction() {
+void GlslShaderTranslator::ProcessControlFlowNopInstruction(uint32_t cf_index) {
   EmitSource("//        cnop\n");
 }
 
@@ -958,6 +959,7 @@ void GlslShaderTranslator::EmitStoreResult(const InstructionResult& result,
     case InstructionStorageTarget::kDepth:
       EmitSourceDepth("gl_FragDepth");
       break;
+    default:
     case InstructionStorageTarget::kNone:
       return;
   }

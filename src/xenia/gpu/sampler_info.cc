@@ -42,6 +42,11 @@ bool SamplerInfo::Prepare(const xenos::xe_gpu_texture_fetch_t& fetch,
           ? static_cast<AnisoFilter>(fetch.aniso_filter)
           : fetch_instr.attributes.aniso_filter;
 
+  out_info->border_color = static_cast<BorderColor>(fetch.border_color);
+  out_info->lod_bias = (fetch.lod_bias) / 32.f;
+  out_info->mip_min_level = fetch.mip_min_level;
+  out_info->mip_max_level = fetch.mip_max_level;
+
   return true;
 }
 

@@ -27,7 +27,7 @@ typedef uint32_t X_HANDLE;
 // TODO(benvanik): type all of this so we get some safety.
 
 // NT_STATUS (STATUS_*)
-// http://msdn.microsoft.com/en-us/library/cc704588.aspx
+// https://msdn.microsoft.com/en-us/library/cc704588.aspx
 // Adding as needed.
 typedef uint32_t X_STATUS;
 #define XSUCCEEDED(s)     ((s & 0xC0000000) == 0)
@@ -60,52 +60,60 @@ typedef uint32_t X_STATUS;
 #define X_STATUS_OBJECT_NAME_COLLISION                  ((X_STATUS)0xC0000035L)
 #define X_STATUS_INVALID_PAGE_PROTECTION                ((X_STATUS)0xC0000045L)
 #define X_STATUS_MUTANT_NOT_OWNED                       ((X_STATUS)0xC0000046L)
+#define X_STATUS_PROCEDURE_NOT_FOUND                    ((X_STATUS)0xC000007AL)
 #define X_STATUS_INSUFFICIENT_RESOURCES                 ((X_STATUS)0xC000009AL)
 #define X_STATUS_MEMORY_NOT_ALLOCATED                   ((X_STATUS)0xC00000A0L)
+#define X_STATUS_NOT_SUPPORTED                          ((X_STATUS)0xC00000BBL)
 #define X_STATUS_INVALID_PARAMETER_1                    ((X_STATUS)0xC00000EFL)
 #define X_STATUS_INVALID_PARAMETER_2                    ((X_STATUS)0xC00000F0L)
 #define X_STATUS_INVALID_PARAMETER_3                    ((X_STATUS)0xC00000F1L)
 #define X_STATUS_DLL_NOT_FOUND                          ((X_STATUS)0xC0000135L)
+#define X_STATUS_ENTRYPOINT_NOT_FOUND                   ((X_STATUS)0xC0000139L)
 #define X_STATUS_MAPPED_ALIGNMENT                       ((X_STATUS)0xC0000220L)
 #define X_STATUS_NOT_FOUND                              ((X_STATUS)0xC0000225L)
 #define X_STATUS_DRIVER_ORDINAL_NOT_FOUND               ((X_STATUS)0xC0000262L)
 #define X_STATUS_DRIVER_ENTRYPOINT_NOT_FOUND            ((X_STATUS)0xC0000263L)
 
-// HRESULT (ERROR_*)
+// Win32 error codes (ERROR_*)
+// https://msdn.microsoft.com/en-us/library/windows/desktop/ms681381(v=vs.85).aspx
 // Adding as needed.
-// For some reason, half of these aren't *actually* HRESULTs.
-// Windows is a weird place.
 typedef uint32_t X_RESULT;
-#define X_FACILITY_WIN32 7
-#define X_RESULT_FROM_WIN32(x) x
-// Maybe X_RESULT_FROM_WIN32 is this instead?:
-// ((X_RESULT)(x) <= 0 ? ((X_RESULT)(x)) :
-//     ((X_RESULT) (((x) & 0x0000FFFF) | (X_FACILITY_WIN32 << 16) | 0x80000000)))
-#define X_ERROR_SUCCESS                                 X_RESULT_FROM_WIN32(0x00000000L)
-#define X_ERROR_FILE_NOT_FOUND                          X_RESULT_FROM_WIN32(0x00000002L)
-#define X_ERROR_PATH_NOT_FOUND                          X_RESULT_FROM_WIN32(0x00000003L)
-#define X_ERROR_ACCESS_DENIED                           X_RESULT_FROM_WIN32(0x00000005L)
-#define X_ERROR_INVALID_HANDLE                          X_RESULT_FROM_WIN32(0x00000006L)
-#define X_ERROR_NO_MORE_FILES                           X_RESULT_FROM_WIN32(0x00000012L)
-#define X_ERROR_INVALID_PARAMETER                       X_RESULT_FROM_WIN32(0x00000057L)
-#define X_ERROR_IO_PENDING                              X_RESULT_FROM_WIN32(0x000003E5L)
-#define X_ERROR_INSUFFICIENT_BUFFER                     X_RESULT_FROM_WIN32(0x0000007AL)
-#define X_ERROR_INVALID_NAME                            X_RESULT_FROM_WIN32(0x0000007BL)
-#define X_ERROR_BAD_ARGUMENTS                           X_RESULT_FROM_WIN32(0x000000A0L)
-#define X_ERROR_BUSY                                    X_RESULT_FROM_WIN32(0x000000AAL)
-#define X_ERROR_ALREADY_EXISTS                          X_RESULT_FROM_WIN32(0x000000B7L)
-#define X_ERROR_DEVICE_NOT_CONNECTED                    X_RESULT_FROM_WIN32(0x0000048FL)
-#define X_ERROR_NOT_FOUND                               X_RESULT_FROM_WIN32(0x00000490L)
-#define X_ERROR_CANCELLED                               X_RESULT_FROM_WIN32(0x000004C7L)
-#define X_ERROR_NOT_LOGGED_ON                           X_RESULT_FROM_WIN32(0x000004DDL)
-#define X_ERROR_NO_SUCH_USER                            X_RESULT_FROM_WIN32(0x00000525L)
-#define X_ERROR_FUNCTION_FAILED                         X_RESULT_FROM_WIN32(0x0000065BL)
-#define X_ERROR_EMPTY                                   X_RESULT_FROM_WIN32(0x000010D2L)
+#define X_FACILITY_WIN32 0x0007
+#define X_RESULT_FROM_WIN32(x) ((X_RESULT)(x))
 
+#define X_ERROR_SUCCESS                         X_RESULT_FROM_WIN32(0x00000000L)
+#define X_ERROR_FILE_NOT_FOUND                  X_RESULT_FROM_WIN32(0x00000002L)
+#define X_ERROR_PATH_NOT_FOUND                  X_RESULT_FROM_WIN32(0x00000003L)
+#define X_ERROR_ACCESS_DENIED                   X_RESULT_FROM_WIN32(0x00000005L)
+#define X_ERROR_INVALID_HANDLE                  X_RESULT_FROM_WIN32(0x00000006L)
+#define X_ERROR_NO_MORE_FILES                   X_RESULT_FROM_WIN32(0x00000012L)
+#define X_ERROR_INVALID_PARAMETER               X_RESULT_FROM_WIN32(0x00000057L)
+#define X_ERROR_IO_PENDING                      X_RESULT_FROM_WIN32(0x000003E5L)
+#define X_ERROR_INSUFFICIENT_BUFFER             X_RESULT_FROM_WIN32(0x0000007AL)
+#define X_ERROR_INVALID_NAME                    X_RESULT_FROM_WIN32(0x0000007BL)
+#define X_ERROR_BAD_ARGUMENTS                   X_RESULT_FROM_WIN32(0x000000A0L)
+#define X_ERROR_BUSY                            X_RESULT_FROM_WIN32(0x000000AAL)
+#define X_ERROR_ALREADY_EXISTS                  X_RESULT_FROM_WIN32(0x000000B7L)
+#define X_ERROR_DEVICE_NOT_CONNECTED            X_RESULT_FROM_WIN32(0x0000048FL)
+#define X_ERROR_NOT_FOUND                       X_RESULT_FROM_WIN32(0x00000490L)
+#define X_ERROR_CANCELLED                       X_RESULT_FROM_WIN32(0x000004C7L)
+#define X_ERROR_NOT_LOGGED_ON                   X_RESULT_FROM_WIN32(0x000004DDL)
+#define X_ERROR_NO_SUCH_USER                    X_RESULT_FROM_WIN32(0x00000525L)
+#define X_ERROR_FUNCTION_FAILED                 X_RESULT_FROM_WIN32(0x0000065BL)
+#define X_ERROR_EMPTY                           X_RESULT_FROM_WIN32(0x000010D2L)
+
+// HRESULT codes
 typedef uint32_t X_HRESULT;
-#define X_E_SUCCESS                                     static_cast<X_HRESULT>(0)
-#define X_E_FALSE                                       static_cast<X_HRESULT>(0x80000000L)
-#define X_E_INVALIDARG                                  static_cast<X_HRESULT>(0x80070057L)
+#define X_HRESULT_FROM_WIN32(x) ((int32_t)(x) <= 0 \
+                                  ? (static_cast<X_HRESULT>(x)) \
+                                  : (static_cast<X_HRESULT>(((x) & 0xFFFF) | (X_FACILITY_WIN32 << 16) | \
+                                    0x80000000L)))
+
+#define X_E_FALSE                               static_cast<X_HRESULT>(0x80000000L)
+#define X_E_SUCCESS                             X_HRESULT_FROM_WIN32(X_ERROR_SUCCESS)
+#define X_E_INVALIDARG                          X_HRESULT_FROM_WIN32(X_ERROR_INVALID_PARAMETER)
+#define X_E_DEVICE_NOT_CONNECTED                X_HRESULT_FROM_WIN32(X_ERROR_DEVICE_NOT_CONNECTED)
+#define X_E_NO_SUCH_USER                        X_HRESULT_FROM_WIN32(X_ERROR_NO_SUCH_USER)
 
 // MEM_*, used by NtAllocateVirtualMemory
 #define X_MEM_COMMIT              0x00001000
@@ -154,7 +162,7 @@ enum X_FILE_ATTRIBUTES : uint32_t {
   X_FILE_ATTRIBUTE_ENCRYPTED = 0x4000,
 };
 
-// http://code.google.com/p/vdash/source/browse/trunk/vdash/include/kernel.h
+// https://github.com/oukiar/vdash/blob/master/vdash/include/kernel.h
 enum X_FILE_INFORMATION_CLASS {
   XFileDirectoryInformation = 1,
   XFileFullDirectoryInformation,
@@ -318,10 +326,10 @@ struct X_UNICODE_STRING {
 };
 static_assert_size(X_UNICODE_STRING, 8);
 
-// http://pastebin.com/SMypYikG
+// https://pastebin.com/SMypYikG
 typedef uint32_t XNotificationID;
 
-// http://ffplay360.googlecode.com/svn/trunk/Common/XTLOnPC.h
+// https://github.com/CodeAsm/ffplay360/blob/master/Common/XTLOnPC.h
 struct X_VIDEO_MODE {
   be<uint32_t> display_width;
   be<uint32_t> display_height;
@@ -355,7 +363,7 @@ struct X_SINGLE_LIST_ENTRY {
 };
 static_assert_size(X_SINGLE_LIST_ENTRY, 4);
 
-// http://www.nirsoft.net/kernel_struct/vista/SLIST_HEADER.html
+// https://www.nirsoft.net/kernel_struct/vista/SLIST_HEADER.html
 struct X_SLIST_HEADER {
   X_SINGLE_LIST_ENTRY next;  // 0x0
   be<uint16_t> depth;        // 0x4
@@ -384,6 +392,17 @@ struct X_OBJECT_ATTRIBUTES {
   xe::be<uint32_t> name_ptr;        // 0x4 PANSI_STRING
   xe::be<uint32_t> attributes;      // 0xC
 };
+
+// https://msdn.microsoft.com/en-us/library/windows/desktop/aa363082.aspx
+typedef struct {
+  xe::be<uint32_t> exception_code;
+  xe::be<uint32_t> exception_flags;
+  xe::be<uint32_t> exception_record;
+  xe::be<uint32_t> exception_address;
+  xe::be<uint32_t> number_parameters;
+  xe::be<uint32_t> exception_information[15];
+} X_EXCEPTION_RECORD;
+static_assert_size(X_EXCEPTION_RECORD, 0x50);
 
 #pragma pack(pop)
 

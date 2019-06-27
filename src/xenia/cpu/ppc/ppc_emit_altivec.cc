@@ -13,6 +13,8 @@
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/ppc/ppc_hir_builder.h"
 
+#include <cmath>
+
 namespace xe {
 namespace cpu {
 namespace ppc {
@@ -29,7 +31,7 @@ Value* CalculateEA_0(PPCHIRBuilder& f, uint32_t ra, uint32_t rb);
 // Most of this file comes from:
 // http://biallas.net/doc/vmx128/vmx128.txt
 // https://github.com/kakaroto/ps3ida/blob/master/plugins/PPCAltivec/src/main.cpp
-// http://sannybuilder.com/forums/viewtopic.php?id=190
+// https://sannybuilder.com/forums/viewtopic.php?id=190
 
 #define OP(x) ((((uint32_t)(x)) & 0x3f) << 26)
 #define VX128(op, xop) (OP(op) | (((uint32_t)(xop)) & 0x3d0))
@@ -244,6 +246,10 @@ int InstrEmit_lvrx_(PPCHIRBuilder& f, const InstrData& i, uint32_t vd,
   f.Branch(end_label);
   f.MarkLabel(load_label);
   // ea &= ~0xF
+  // NOTE: need to recalculate ea and eb because after Branch we start a new
+  // block and we can't use their previous instantiation in the new block
+  ea = CalculateEA_0(f, ra, rb);
+  eb = f.And(f.Truncate(ea, INT8_TYPE), f.LoadConstantInt8(0xF));
   ea = f.And(ea, f.LoadConstantUint64(~0xFull));
   // v = (new >> (16 - eb))
   Value* v = f.Permute(f.LoadVectorShl(eb), f.LoadZeroVec128(),
@@ -310,6 +316,10 @@ int InstrEmit_stvrx_(PPCHIRBuilder& f, const InstrData& i, uint32_t vd,
   auto skip_label = f.NewLabel();
   f.BranchFalse(eb, skip_label);
   // ea &= ~0xF
+  // NOTE: need to recalculate ea and eb because after Branch we start a new
+  // block and we can't use their previous instantiation in the new block
+  ea = CalculateEA_0(f, ra, rb);
+  eb = f.And(f.Truncate(ea, INT8_TYPE), f.LoadConstantInt8(0xF));
   ea = f.And(ea, f.LoadConstantUint64(~0xFull));
   // v = (old & ~mask) | ((new << eb) & mask)
   Value* new_value = f.Permute(f.LoadVectorShr(eb), f.LoadVR(vd),
@@ -544,7 +554,7 @@ int InstrEmit_vctsxs_(PPCHIRBuilder& f, uint32_t vd, uint32_t vb,
   float fuimm = static_cast<float>(std::exp2(uimm));
   Value* v =
       f.Mul(f.LoadVR(vb), f.Splat(f.LoadConstantFloat32(fuimm), VEC128_TYPE));
-  v = f.VectorConvertF2I(v, ARITHMETIC_SATURATE);
+  v = f.VectorConvertF2I(v);
   f.StoreSAT(f.DidSaturate(v));
   f.StoreVR(vd, v);
   return 0;
@@ -562,7 +572,7 @@ int InstrEmit_vctuxs_(PPCHIRBuilder& f, uint32_t vd, uint32_t vb,
   float fuimm = static_cast<float>(std::exp2(uimm));
   Value* v =
       f.Mul(f.LoadVR(vb), f.Splat(f.LoadConstantFloat32(fuimm), VEC128_TYPE));
-  v = f.VectorConvertF2I(v, ARITHMETIC_UNSIGNED | ARITHMETIC_SATURATE);
+  v = f.VectorConvertF2I(v, ARITHMETIC_UNSIGNED);
   f.StoreSAT(f.DidSaturate(v));
   f.StoreVR(vd, v);
   return 0;
@@ -1210,8 +1220,7 @@ int InstrEmit_vpermwi128(PPCHIRBuilder& f, const InstrData& i) {
 
 int InstrEmit_vrefp_(PPCHIRBuilder& f, uint32_t vd, uint32_t vb) {
   // (VD) <- 1/(VB)
-  vec128_t one = vec128f(1.0f);
-  Value* v = f.Div(f.LoadConstantVec128(one), f.LoadVR(vb));
+  Value* v = f.Recip(f.LoadVR(vb));
   f.StoreVR(vd, v);
   return 0;
 }
@@ -2049,6 +2058,9 @@ int InstrEmit_vpkd3d128(PPCHIRBuilder& f, const InstrData& i) {
     case 3:  // VPACK_... 2 FLOAT16s DXGI_FORMAT_R16G16_FLOAT
       v = f.Pack(v, PACK_TYPE_FLOAT16_2);
       break;
+    case 4:  // VPACK_NORMSHORT4
+      v = f.Pack(v, PACK_TYPE_SHORT_4);
+      break;
     case 5:  // VPACK_... 4 FLOAT16s DXGI_FORMAT_R16G16B16A16_FLOAT
       v = f.Pack(v, PACK_TYPE_FLOAT16_4);
       break;
@@ -2056,12 +2068,12 @@ int InstrEmit_vpkd3d128(PPCHIRBuilder& f, const InstrData& i) {
       assert_unhandled_case(type);
       return 1;
   }
-  // http://hlssmod.net/he_code/public/pixelwriter.h
+  // https://hlssmod.net/he_code/public/pixelwriter.h
   // control = prev:0123 | new:4567
   uint32_t control = kIdentityPermuteMask;  // original
   switch (pack) {
     case 1:  // VPACK_32
-      // VPACK_32 & shift = 3 puts lower 32 bits in x (leftmost slot).
+             // VPACK_32 & shift = 3 puts lower 32 bits in x (leftmost slot).
       switch (shift) {
         case 0:
           control = MakePermuteMask(0, 0, 0, 1, 0, 2, 1, 3);
@@ -2129,7 +2141,8 @@ int InstrEmit_vpkd3d128(PPCHIRBuilder& f, const InstrData& i) {
 
 int InstrEmit_vupkd3d128(PPCHIRBuilder& f, const InstrData& i) {
   // Can't find many docs on this. Best reference is
-  // http://worldcraft.googlecode.com/svn/trunk/src/qylib/math/xmmatrix.inl,
+  // https://code.google.com/archive/p/worldcraft/source/default/source?page=4
+  // (qylib/math/xmmatrix.inl)
   // which shows how it's used in some cases. Since it's all intrinsics,
   // finding it in code is pretty easy.
   const uint32_t vd = i.VX128_3.VD128l | (i.VX128_3.VD128h << 5);
@@ -2149,8 +2162,8 @@ int InstrEmit_vupkd3d128(PPCHIRBuilder& f, const InstrData& i) {
     case 3:  // VPACK_... 2 FLOAT16s DXGI_FORMAT_R16G16_FLOAT
       v = f.Unpack(v, PACK_TYPE_FLOAT16_2);
       break;
-    case 4:
-      v = f.Unpack(v, PACK_TYPE_FLOAT16_3);
+    case 4:  // VPACK_NORMSHORT4
+      v = f.Unpack(v, PACK_TYPE_SHORT_4);
       break;
     case 5:  // VPACK_... 4 FLOAT16s DXGI_FORMAT_R16G16B16A16_FLOAT
       v = f.Unpack(v, PACK_TYPE_FLOAT16_4);

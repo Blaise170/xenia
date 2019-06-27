@@ -49,6 +49,32 @@ bool DiscImageDevice::Initialize() {
   return true;
 }
 
+void DiscImageDevice::Dump(StringBuffer* string_buffer) {
+  auto global_lock = global_critical_region_.Acquire();
+  root_entry_->Dump(string_buffer, 0);
+}
+
+Entry* DiscImageDevice::ResolvePath(std::string path) {
+  // The filesystem will have stripped our prefix off already, so the path will
+  // be in the form:
+  // some\PATH.foo
+
+  XELOGFS("DiscImageDevice::ResolvePath(%s)", path.c_str());
+
+  // Walk the path, one separator at a time.
+  auto entry = root_entry_.get();
+  auto path_parts = xe::split_path(path);
+  for (auto& part : path_parts) {
+    entry = entry->GetChild(part);
+    if (!entry) {
+      // Not found.
+      return nullptr;
+    }
+  }
+
+  return entry;
+}
+
 DiscImageDevice::Error DiscImageDevice::Verify(ParseState* state) {
   // Find sector 32 of the game partition - try at a few points.
   static const size_t likely_offsets[] = {
@@ -127,9 +153,11 @@ bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer,
   entry->attributes_ = attributes | kFileAttributeReadOnly;
   entry->size_ = length;
   entry->allocation_size_ = xe::round_up(length, bytes_per_sector());
-  entry->create_timestamp_ = 0;
-  entry->access_timestamp_ = 0;
-  entry->write_timestamp_ = 0;
+
+  // Set to January 1, 1970 (UTC) in 100-nanosecond intervals
+  entry->create_timestamp_ = 10000 * 11644473600000LL;
+  entry->access_timestamp_ = 10000 * 11644473600000LL;
+  entry->write_timestamp_ = 10000 * 11644473600000LL;
 
   if (attributes & kFileAttributeDirectory) {
     // Folder.

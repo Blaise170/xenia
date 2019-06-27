@@ -14,18 +14,22 @@
 
 #include "third_party/imgui/imgui.h"
 #include "xenia/base/clock.h"
+#include "xenia/base/debugging.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/graphics_system.h"
+
+#include "xenia/ui/file_picker.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 
 namespace xe {
 namespace app {
 
+using xe::ui::FileDropEvent;
 using xe::ui::KeyEvent;
 using xe::ui::MenuItem;
 using xe::ui::MouseEvent;
@@ -37,7 +41,15 @@ EmulatorWindow::EmulatorWindow(Emulator* emulator)
     : emulator_(emulator),
       loop_(ui::Loop::Create()),
       window_(ui::Window::Create(loop_.get(), kBaseTitle)) {
-  base_title_ = kBaseTitle + L" (" + xe::to_wstring(XE_BUILD_BRANCH) + L"/" +
+  base_title_ = kBaseTitle +
+#ifdef DEBUG
+#if _NO_DEBUG_HEAP == 1
+                L" DEBUG" +
+#else
+                L" CHECKED" +
+#endif
+#endif
+                L" (" + xe::to_wstring(XE_BUILD_BRANCH) + L"/" +
                 xe::to_wstring(XE_BUILD_COMMIT_SHORT) + L"/" +
                 xe::to_wstring(XE_BUILD_DATE) + L")";
 }
@@ -70,18 +82,20 @@ bool EmulatorWindow::Initialize() {
 
   UpdateTitle();
 
-  window_->on_closed.AddListener([this](UIEvent* e) {
-    loop_->Quit();
-
-    // TODO(benvanik): proper exit.
-    XELOGI("User-initiated death!");
-    exit(1);
-  });
+  window_->on_closed.AddListener([this](UIEvent* e) { loop_->Quit(); });
   loop_->on_quit.AddListener([this](UIEvent* e) { window_.reset(); });
+
+  window_->on_file_drop.AddListener(
+      [this](FileDropEvent* e) { FileDrop(e->filename()); });
 
   window_->on_key_down.AddListener([this](KeyEvent* e) {
     bool handled = true;
     switch (e->key_code()) {
+      case 0x4F: {  // o
+        if (e->is_ctrl_pressed()) {
+          FileOpen();
+        }
+      } break;
       case 0x6A: {  // numpad *
         CpuTimeScalarReset();
       } break;
@@ -114,7 +128,6 @@ bool EmulatorWindow::Initialize() {
         // TODO: Spawn a new thread to do this.
         emulator()->RestoreFromFile(L"test.sav");
       } break;
-
       case 0x7A: {  // VK_F11
         ToggleFullscreen();
       } break;
@@ -130,6 +143,9 @@ bool EmulatorWindow::Initialize() {
       case 0x13: {  // VK_PAUSE
         CpuBreakIntoDebugger();
       } break;
+      case 0x03: {  // VK_CANCEL
+        CpuBreakIntoHostDebugger();
+      } break;
 
       case 0x70: {  // VK_F1
         ShowHelpWebsite();
@@ -140,11 +156,36 @@ bool EmulatorWindow::Initialize() {
     e->set_handled(handled);
   });
 
+  window_->on_mouse_move.AddListener([this](MouseEvent* e) {
+    if (window_->is_fullscreen() && (e->dx() > 2 || e->dy() > 2)) {
+      if (!window_->is_cursor_visible()) {
+        window_->set_cursor_visible(true);
+      }
+
+      cursor_hide_time_ = Clock::QueryHostSystemTime() + 30000000;
+    }
+
+    e->set_handled(false);
+  });
+
+  window_->on_paint.AddListener([this](UIEvent* e) { CheckHideCursor(); });
+
   // Main menu.
   // FIXME: This code is really messy.
   auto main_menu = MenuItem::Create(MenuItem::Type::kNormal);
   auto file_menu = MenuItem::Create(MenuItem::Type::kPopup, L"&File");
   {
+    file_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, L"&Open...", L"Ctrl+O",
+                         std::bind(&EmulatorWindow::FileOpen, this)));
+    file_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, L"Close",
+                         std::bind(&EmulatorWindow::FileClose, this)));
+    file_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
+    file_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, L"Show content directory...",
+        std::bind(&EmulatorWindow::ShowContentDirectory, this)));
+    file_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
     file_menu->AddChild(MenuItem::Create(MenuItem::Type::kString, L"E&xit",
                                          L"Alt+F4",
                                          [this]() { window_->Close(); }));
@@ -176,8 +217,13 @@ bool EmulatorWindow::Initialize() {
   cpu_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
   {
     cpu_menu->AddChild(MenuItem::Create(
-        MenuItem::Type::kString, L"&Break and Show Debugger", L"Pause/Break",
+        MenuItem::Type::kString, L"&Break and Show Guest Debugger",
+        L"Pause/Break",
         std::bind(&EmulatorWindow::CpuBreakIntoDebugger, this)));
+    cpu_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, L"&Break into Host Debugger",
+        L"Ctrl+Pause/Break",
+        std::bind(&EmulatorWindow::CpuBreakIntoHostDebugger, this)));
   }
   main_menu->AddChild(std::move(cpu_menu));
 
@@ -210,16 +256,17 @@ bool EmulatorWindow::Initialize() {
   {
     help_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, L"Build commit on GitHub...", [this]() {
-          std::string url =
-              std::string("https://github.com/benvanik/xenia/tree/") +
-              XE_BUILD_COMMIT + "/";
+          std::wstring url =
+              std::wstring(L"https://github.com/xenia-project/xenia/tree/") +
+              xe::to_wstring(XE_BUILD_COMMIT) + L"/";
           LaunchBrowser(url.c_str());
         }));
     help_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, L"Recent changes on GitHub...", [this]() {
-          std::string url =
-              std::string("https://github.com/benvanik/xenia/compare/") +
-              XE_BUILD_COMMIT + "..." + XE_BUILD_BRANCH;
+          std::wstring url =
+              std::wstring(L"https://github.com/xenia-project/xenia/compare/") +
+              xe::to_wstring(XE_BUILD_COMMIT) + L"..." +
+              xe::to_wstring(XE_BUILD_BRANCH);
           LaunchBrowser(url.c_str());
         }));
     help_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
@@ -228,7 +275,7 @@ bool EmulatorWindow::Initialize() {
                          std::bind(&EmulatorWindow::ShowHelpWebsite, this)));
     help_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, L"&About...",
-        [this]() { LaunchBrowser("http://xenia.jp/about/"); }));
+        [this]() { LaunchBrowser(L"https://xenia.jp/about/"); }));
   }
   main_menu->AddChild(std::move(help_menu));
 
@@ -236,7 +283,90 @@ bool EmulatorWindow::Initialize() {
 
   window_->Resize(1280, 720);
 
+  window_->DisableMainMenu();
+
   return true;
+}
+
+void EmulatorWindow::FileDrop(wchar_t* filename) {
+  std::wstring path = filename;
+  auto result = emulator_->LaunchPath(path);
+  if (XFAILED(result)) {
+    // TODO: Display a message box.
+    XELOGE("Failed to launch target: %.8X", result);
+  }
+}
+
+void EmulatorWindow::FileOpen() {
+  std::wstring path;
+
+  auto file_picker = xe::ui::FilePicker::Create();
+  file_picker->set_mode(ui::FilePicker::Mode::kOpen);
+  file_picker->set_type(ui::FilePicker::Type::kFile);
+  file_picker->set_multi_selection(false);
+  file_picker->set_title(L"Select Content Package");
+  file_picker->set_extensions({
+      {L"Supported Files", L"*.iso;*.xex;*.xcp;*.*"},
+      {L"Disc Image (*.iso)", L"*.iso"},
+      {L"Xbox Executable (*.xex)", L"*.xex"},
+      //{ L"Content Package (*.xcp)", L"*.xcp" },
+      {L"All Files (*.*)", L"*.*"},
+  });
+  if (file_picker->Show(window_->native_handle())) {
+    auto selected_files = file_picker->selected_files();
+    if (!selected_files.empty()) {
+      path = selected_files[0];
+    }
+  }
+
+  if (!path.empty()) {
+    // Normalize the path and make absolute.
+    std::wstring abs_path = xe::to_absolute_path(path);
+
+    auto result = emulator_->LaunchPath(abs_path);
+    if (XFAILED(result)) {
+      // TODO: Display a message box.
+      XELOGE("Failed to launch target: %.8X", result);
+    }
+  }
+}
+
+void EmulatorWindow::FileClose() {
+  if (emulator_->is_title_open()) {
+    emulator_->TerminateTitle();
+  }
+}
+
+void EmulatorWindow::ShowContentDirectory() {
+  std::wstring target_path;
+
+  auto content_root = emulator_->content_root();
+  if (!emulator_->is_title_open() || !emulator_->kernel_state()) {
+    target_path = content_root;
+  } else {
+    // TODO(gibbed): expose this via ContentManager?
+    wchar_t title_id[9] = L"00000000";
+    std::swprintf(title_id, 9, L"%.8X", emulator_->kernel_state()->title_id());
+    auto package_root = xe::join_paths(content_root, title_id);
+    target_path = package_root;
+  }
+
+  if (!xe::filesystem::PathExists(target_path)) {
+    xe::filesystem::CreateFolder(target_path);
+  }
+
+  LaunchBrowser(target_path.c_str());
+}
+
+void EmulatorWindow::CheckHideCursor() {
+  if (!window_->is_fullscreen()) {
+    // Only hide when fullscreen.
+    return;
+  }
+
+  if (Clock::QueryHostSystemTime() > cursor_hide_time_) {
+    window_->set_cursor_visible(false);
+  }
 }
 
 void EmulatorWindow::CpuTimeScalarReset() {
@@ -272,6 +402,8 @@ void EmulatorWindow::CpuBreakIntoDebugger() {
   }
 }
 
+void EmulatorWindow::CpuBreakIntoHostDebugger() { xe::debugging::Break(); }
+
 void EmulatorWindow::GpuTraceFrame() {
   emulator()->graphics_system()->RequestFrameTrace();
 }
@@ -282,16 +414,29 @@ void EmulatorWindow::GpuClearCaches() {
 
 void EmulatorWindow::ToggleFullscreen() {
   window_->ToggleFullscreen(!window_->is_fullscreen());
+
+  // Hide the cursor after a second if we're going fullscreen
+  cursor_hide_time_ = Clock::QueryHostSystemTime() + 30000000;
+  if (!window_->is_fullscreen()) {
+    window_->set_cursor_visible(true);
+  }
 }
 
-void EmulatorWindow::ShowHelpWebsite() { LaunchBrowser("http://xenia.jp"); }
+void EmulatorWindow::ShowHelpWebsite() { LaunchBrowser(L"https://xenia.jp"); }
 
 void EmulatorWindow::UpdateTitle() {
   std::wstring title(base_title_);
 
-  auto game_title = emulator()->game_title();
-  if (!game_title.empty()) {
-    title += L" - " + game_title;
+  if (emulator()->is_title_open()) {
+    auto game_title = emulator()->game_title();
+    title += xe::format_string(L" | [%.8X] %s", emulator()->title_id(),
+                               game_title.c_str());
+  }
+
+  auto graphics_system = emulator()->graphics_system();
+  if (graphics_system) {
+    auto graphics_name = graphics_system->name();
+    title += L" <" + graphics_name + L">";
   }
 
   if (Clock::guest_time_scalar() != 1.0) {

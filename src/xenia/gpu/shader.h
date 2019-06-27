@@ -31,6 +31,11 @@ enum class InstructionStorageTarget {
   kPosition,
   // Result is stored to the point size export (gl_PointSize).
   kPointSize,
+  // Result is stored as memexport destination address.
+  // [physical >> 2, ??, ??, ??]
+  kExportAddress,
+  // Result is stored to memexport destination data.
+  kExportData,
   // Result is stored to a color target export indexed by storage_index [0-3].
   kColorTarget,
   // Result is stored to the depth export (gl_FragDepth).
@@ -98,6 +103,17 @@ struct InstructionResult {
   // Returns true if all components are written to.
   bool has_all_writes() const {
     return write_mask[0] && write_mask[1] && write_mask[2] && write_mask[3];
+  }
+  // Returns number of components written
+  uint32_t num_writes() const {
+    uint32_t total = 0;
+    for (int i = 0; i < 4; i++) {
+      if (write_mask[i]) {
+        total++;
+      }
+    }
+
+    return total;
   }
   // Returns true if any non-constant components are written.
   bool stores_non_constants() const {
@@ -405,6 +421,7 @@ struct ParsedTextureFetchInstruction {
     bool use_computed_lod = true;
     bool use_register_lod = false;
     bool use_register_gradients = false;
+    float lod_bias = 0.0f;
     float offset_x = 0.0f;
     float offset_y = 0.0f;
     float offset_z = 0.0f;
@@ -493,6 +510,24 @@ class Shader {
     ParsedTextureFetchInstruction fetch_instr;
   };
 
+  struct ConstantRegisterMap {
+    // Bitmap of all kConstantFloat registers read by the shader.
+    // Any shader can only read up to 256 of the 512, and the base is dependent
+    // on the shader type. Each bit corresponds to a storage index from the type
+    // base, so bit 0 in a vertex shader is register 0, and bit 0 in a fragment
+    // shader is register 256.
+    uint64_t float_bitmap[256 / 64];
+    // Bitmap of all kConstantInt registers read by the shader.
+    // Each bit corresponds to a storage index [0-31].
+    uint32_t int_bitmap;
+    // Bitmap of all kConstantBool registers read by the shader.
+    // Each bit corresponds to a storage index [0-255].
+    uint32_t bool_bitmap[256 / 32];
+
+    // Computed byte count of all registers required when packed.
+    uint32_t packed_byte_length;
+  };
+
   Shader(ShaderType shader_type, uint64_t ucode_data_hash,
          const uint32_t* ucode_dwords, size_t ucode_dword_count);
   virtual ~Shader();
@@ -502,6 +537,7 @@ class Shader {
 
   // Microcode dwords in host endianness.
   const std::vector<uint32_t>& ucode_data() const { return ucode_data_; }
+  uint64_t ucode_data_hash() const { return ucode_data_hash_; }
   const uint32_t* ucode_dwords() const { return ucode_data_.data(); }
   size_t ucode_dword_count() const { return ucode_data_.size(); }
 
@@ -517,11 +553,19 @@ class Shader {
     return texture_bindings_;
   }
 
+  // Bitmaps of all constant registers accessed by the shader.
+  const ConstantRegisterMap& constant_register_map() const {
+    return constant_register_map_;
+  }
+
   // Returns true if the given color target index [0-3].
   bool writes_color_target(int i) const { return writes_color_targets_[i]; }
 
   // True if the shader was translated and prepared without error.
   bool is_valid() const { return is_valid_; }
+
+  // True if the shader has already been translated.
+  bool is_translated() const { return is_translated_; }
 
   // Errors that occurred during translation.
   const std::vector<Error>& errors() const { return errors_; }
@@ -547,13 +591,12 @@ class Shader {
   // May be empty if the host does not support saving binaries.
   const std::vector<uint8_t>& host_binary() const { return host_binary_; }
 
-  // Prepares the shader for use in the host graphics API.
-  virtual bool Prepare() { return is_valid_; }
-
   // Dumps the shader to a file in the given path based on ucode hash.
   // Both the ucode binary and disassembled and translated shader will be
   // written.
-  void Dump(const std::string& base_path, const char* path_prefix);
+  // Returns the filename of the shader and the binary.
+  std::pair<std::string, std::string> Dump(const std::string& base_path,
+                                           const char* path_prefix);
 
  protected:
   friend class ShaderTranslator;
@@ -564,9 +607,11 @@ class Shader {
 
   std::vector<VertexBinding> vertex_bindings_;
   std::vector<TextureBinding> texture_bindings_;
+  ConstantRegisterMap constant_register_map_ = {0};
   bool writes_color_targets_[4] = {false, false, false, false};
 
   bool is_valid_ = false;
+  bool is_translated_ = false;
   std::vector<Error> errors_;
 
   std::string ucode_disassembly_;

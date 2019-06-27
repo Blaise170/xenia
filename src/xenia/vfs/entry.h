@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "xenia/base/filesystem.h"
+#include "xenia/base/filesystem_wildcard.h"
 #include "xenia/base/mapped_memory.h"
 #include "xenia/base/mutex.h"
 #include "xenia/base/string_buffer.h"
@@ -33,7 +34,7 @@ namespace vfs {
 class Device;
 class File;
 
-// Matches http://source.winehq.org/source/include/winternl.h#1591.
+// Matches https://source.winehq.org/source/include/winternl.h#1591.
 enum class FileAction {
   kSuperseded = 0,
   kOpened = 1,
@@ -97,6 +98,9 @@ class Entry {
 
   Entry* GetChild(std::string name);
 
+  const std::vector<std::unique_ptr<Entry>>& children() const {
+    return children_;
+  }
   size_t child_count() const { return children_.size(); }
   Entry* IterateChildren(const xe::filesystem::WildcardEngine& engine,
                          size_t* current_index);

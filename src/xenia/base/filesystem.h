@@ -20,6 +20,15 @@
 namespace xe {
 namespace filesystem {
 
+// Get executable path.
+std::wstring GetExecutablePath();
+
+// Get executable folder.
+std::wstring GetExecutableFolder();
+
+// Get user folder.
+std::wstring GetUserFolder();
+
 // Canonicalizes a path, removing ..'s.
 std::string CanonicalizePath(const std::string& original_path);
 
@@ -88,6 +97,9 @@ class FileHandle {
   virtual bool Write(size_t file_offset, const void* buffer,
                      size_t buffer_length, size_t* out_bytes_written) = 0;
 
+  // Set length of the file in bytes.
+  virtual bool SetLength(size_t length) = 0;
+
   // Flushes any pending write buffers to the underlying filesystem.
   virtual void Flush() = 0;
 
@@ -104,6 +116,7 @@ struct FileInfo {
   };
   Type type;
   std::wstring name;
+  std::wstring path;
   size_t total_size;
   uint64_t create_timestamp;
   uint64_t access_timestamp;
@@ -111,40 +124,6 @@ struct FileInfo {
 };
 bool GetInfo(const std::wstring& path, FileInfo* out_info);
 std::vector<FileInfo> ListFiles(const std::wstring& path);
-
-class WildcardFlags {
- public:
-  bool FromStart : 1, ToEnd : 1;
-
-  WildcardFlags();
-  WildcardFlags(bool start, bool end);
-
-  static WildcardFlags FIRST;
-  static WildcardFlags LAST;
-};
-
-class WildcardRule {
- public:
-  WildcardRule(const std::string& str_match, const WildcardFlags& flags);
-  bool Check(const std::string& str_lower,
-             std::string::size_type* offset) const;
-
- private:
-  std::string match;
-  WildcardFlags rules;
-};
-
-class WildcardEngine {
- public:
-  void SetRule(const std::string& pattern);
-
-  // Always ignoring case
-  bool Match(const std::string& str) const;
-
- private:
-  std::vector<WildcardRule> rules;
-  void PreparePattern(const std::string& pattern);
-};
 
 }  // namespace filesystem
 }  // namespace xe

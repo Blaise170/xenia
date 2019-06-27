@@ -960,7 +960,7 @@ int InstrEmit_rlwimix(PPCHIRBuilder& f, const InstrData& i) {
   // RA <- r&m | (RA)&¬m
   Value* v = f.LoadGPR(i.M.RT);
   // (x||x)
-  v = f.Or(f.Shl(v, 32), f.And(v, f.LoadConstantUint64(0xFFFFFFFF)));
+  v = f.Or(f.Shl(v, 32), f.ZeroExtend(f.Truncate(v, INT32_TYPE), INT64_TYPE));
   if (i.M.SH) {
     v = f.RotateLeft(v, f.LoadConstantInt8(i.M.SH));
   }
@@ -984,8 +984,10 @@ int InstrEmit_rlwinmx(PPCHIRBuilder& f, const InstrData& i) {
   // m <- MASK(MB+32, ME+32)
   // RA <- r & m
   Value* v = f.LoadGPR(i.M.RT);
+
   // (x||x)
-  v = f.Or(f.Shl(v, 32), f.And(v, f.LoadConstantUint64(0xFFFFFFFF)));
+  v = f.Or(f.Shl(v, 32), f.ZeroExtend(f.Truncate(v, INT32_TYPE), INT64_TYPE));
+
   // TODO(benvanik): optimize srwi
   // TODO(benvanik): optimize slwi
   // The compiler will generate a bunch of these for the special case of SH=0.
@@ -1016,7 +1018,7 @@ int InstrEmit_rlwnmx(PPCHIRBuilder& f, const InstrData& i) {
       f.And(f.Truncate(f.LoadGPR(i.M.SH), INT8_TYPE), f.LoadConstantInt8(0x1F));
   Value* v = f.LoadGPR(i.M.RT);
   // (x||x)
-  v = f.Or(f.Shl(v, 32), f.And(v, f.LoadConstantUint64(0xFFFFFFFF)));
+  v = f.Or(f.Shl(v, 32), f.ZeroExtend(f.Truncate(v, INT32_TYPE), INT64_TYPE));
   v = f.RotateLeft(v, sh);
   v = f.And(v, f.LoadConstantUint64(XEMASK(i.M.MB + 32, i.M.ME + 32)));
   f.StoreGPR(i.M.RA, v);
@@ -1075,8 +1077,8 @@ int InstrEmit_srdx(PPCHIRBuilder& f, const InstrData& i) {
   // else
   //   m <- i64.0
   // RA <- r & m
-  // TODO(benvanik): if >3F, zero out the result.
-  Value* sh = f.Truncate(f.LoadGPR(i.X.RB), INT8_TYPE);
+  Value* sh =
+      f.And(f.Truncate(f.LoadGPR(i.X.RB), INT8_TYPE), f.LoadConstantInt8(0x7F));
   Value* v = f.Select(f.IsTrue(f.And(sh, f.LoadConstantInt8(0x40))),
                       f.LoadZeroInt64(), f.Shr(f.LoadGPR(i.X.RT), sh));
   f.StoreGPR(i.X.RA, v);
@@ -1094,8 +1096,8 @@ int InstrEmit_srwx(PPCHIRBuilder& f, const InstrData& i) {
   // else
   //   m <- i64.0
   // RA <- r & m
-  // TODO(benvanik): if >1F, zero out the result.
-  Value* sh = f.Truncate(f.LoadGPR(i.X.RB), INT8_TYPE);
+  Value* sh =
+      f.And(f.Truncate(f.LoadGPR(i.X.RB), INT8_TYPE), f.LoadConstantInt8(0x3F));
   Value* v =
       f.Select(f.IsTrue(f.And(sh, f.LoadConstantInt8(0x20))), f.LoadZeroInt32(),
                f.Shr(f.Truncate(f.LoadGPR(i.X.RT), INT32_TYPE), sh));

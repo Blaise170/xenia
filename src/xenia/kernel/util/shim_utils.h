@@ -210,7 +210,7 @@ class PrimitivePointerParam : public ParamBase<uint32_t> {
     return reinterpret_cast<uintptr_t>(host_ptr_);
   }
   T value() const { return *host_ptr_; }
-  operator T() const { return *host_ptr_; }
+  operator T() const = delete;
   operator xe::be<T>*() const { return host_ptr_; }
   operator bool() const { return host_ptr_ != nullptr; }
   void Zero() const {
@@ -304,6 +304,7 @@ using qword_t = const shim::ParamBase<uint64_t>&;
 using float_t = const shim::ParamBase<float>&;
 using double_t = const shim::ParamBase<double>&;
 using lpvoid_t = const shim::PointerParam&;
+using lpword_t = const shim::PrimitivePointerParam<uint16_t>&;
 using lpdword_t = const shim::PrimitivePointerParam<uint32_t>&;
 using lpqword_t = const shim::PrimitivePointerParam<uint64_t>&;
 using lpfloat_t = const shim::PrimitivePointerParam<float>&;
@@ -316,8 +317,14 @@ using lpunknown_t = const shim::PointerParam&;
 template <typename T>
 using pointer_t = const shim::TypedPointerParam<T>&;
 
+using int_result_t = shim::Result<int32_t>;
 using dword_result_t = shim::Result<uint32_t>;
 using pointer_result_t = shim::Result<uint32_t>;
+using X_HRESULT_result_t = shim::Result<X_HRESULT>;
+
+// Exported from kernel_state.cc.
+KernelState* kernel_state();
+inline Memory* kernel_memory() { return kernel_state()->memory(); }
 
 namespace shim {
 
@@ -366,6 +373,44 @@ inline void AppendParam(StringBuffer* string_buffer, lpdouble_t param) {
     string_buffer->AppendFormat("(%G)", param.value());
   }
 }
+inline void AppendParam(StringBuffer* string_buffer, lpstring_t param) {
+  string_buffer->AppendFormat("%.8X", param.guest_address());
+  if (param) {
+    string_buffer->AppendFormat("(%s)", param.value().c_str());
+  }
+}
+inline void AppendParam(StringBuffer* string_buffer, lpwstring_t param) {
+  string_buffer->AppendFormat("%.8X", param.guest_address());
+  if (param) {
+    string_buffer->AppendFormat("(%S)", param.value().c_str());
+  }
+}
+inline void AppendParam(StringBuffer* string_buffer,
+                        pointer_t<X_OBJECT_ATTRIBUTES> record) {
+  string_buffer->AppendFormat("%.8X", record.guest_address());
+  if (record) {
+    auto name_string =
+        kernel_memory()->TranslateVirtual<X_ANSI_STRING*>(record->name_ptr);
+    std::string name =
+        name_string == nullptr
+            ? "(null)"
+            : name_string->to_string(kernel_memory()->virtual_membase());
+    string_buffer->AppendFormat("(%.8X,%s,%.8X)",
+                                uint32_t(record->root_directory), name.c_str(),
+                                uint32_t(record->attributes));
+  }
+}
+inline void AppendParam(StringBuffer* string_buffer,
+                        pointer_t<X_EX_TITLE_TERMINATE_REGISTRATION> reg) {
+  string_buffer->AppendFormat("%.8X(%.8X, %.8X)", reg.guest_address(),
+                              static_cast<uint32_t>(reg->notification_routine),
+                              static_cast<uint32_t>(reg->priority));
+}
+inline void AppendParam(StringBuffer* string_buffer,
+                        pointer_t<X_EXCEPTION_RECORD> record) {
+  string_buffer->AppendFormat("%.8X(%.8X)", record.guest_address(),
+                              uint32_t(record->exception_code));
+}
 template <typename T>
 void AppendParam(StringBuffer* string_buffer, pointer_t<T> param) {
   string_buffer->AppendFormat("%.8X", param.guest_address());
@@ -374,6 +419,7 @@ void AppendParam(StringBuffer* string_buffer, pointer_t<T> param) {
 enum class KernelModuleId {
   xboxkrnl,
   xam,
+  xbdm,
 };
 
 template <size_t I = 0, typename... Ps>
@@ -405,9 +451,11 @@ void PrintKernelCall(cpu::Export* export_entry, const Tuple& params) {
   AppendKernelCallParams(string_buffer, export_entry, params);
   string_buffer.Append(')');
   if (export_entry->tags & xe::cpu::ExportTag::kImportant) {
-    xe::LogLine('i', string_buffer.GetString(), string_buffer.length());
+    xe::LogLine(xe::LogLevel::Info, 'i', string_buffer.GetString(),
+                string_buffer.length());
   } else {
-    xe::LogLine('d', string_buffer.GetString(), string_buffer.length());
+    xe::LogLine(xe::LogLevel::Debug, 'd', string_buffer.GetString(),
+                string_buffer.length());
   }
 }
 
@@ -427,7 +475,9 @@ xe::cpu::Export* RegisterExport(R (*fn)(Ps&...), const char* name,
     static void Trampoline(PPCContext* ppc_context) {
       ++export_entry->function_data.call_count;
       Param::Init init = {
-          ppc_context, sizeof...(Ps), 0,
+          ppc_context,
+          sizeof...(Ps),
+          0,
       };
       auto params = std::make_tuple<Ps...>(Ps(init)...);
       if (export_entry->tags & xe::cpu::ExportTag::kLog &&
@@ -460,7 +510,8 @@ xe::cpu::Export* RegisterExport(void (*fn)(Ps&...), const char* name,
     static void Trampoline(PPCContext* ppc_context) {
       ++export_entry->function_data.call_count;
       Param::Init init = {
-          ppc_context, sizeof...(Ps),
+          ppc_context,
+          sizeof...(Ps),
       };
       auto params = std::make_tuple<Ps...>(Ps(init)...);
       if (export_entry->tags & xe::cpu::ExportTag::kLog &&
@@ -480,18 +531,43 @@ xe::cpu::Export* RegisterExport(void (*fn)(Ps&...), const char* name,
 
 using xe::cpu::ExportTag;
 
-#define DECLARE_EXPORT(module_name, name, tags)                            \
+#define DECLARE_EXPORT(module_name, name, category, tags)                  \
   const auto EXPORT_##module_name##_##name = RegisterExport_##module_name( \
       xe::kernel::shim::RegisterExport<                                    \
           xe::kernel::shim::KernelModuleId::module_name, ordinals::name>(  \
-          &name, #name, tags));
+          &name, #name,                                                    \
+          tags | (static_cast<xe::cpu::ExportTag::type>(                   \
+                      xe::cpu::ExportCategory::category)                   \
+                  << xe::cpu::ExportTag::CategoryShift)));
 
-#define DECLARE_XAM_EXPORT(name, tags) DECLARE_EXPORT(xam, name, tags)
-#define DECLARE_XBOXKRNL_EXPORT(name, tags) DECLARE_EXPORT(xboxkrnl, name, tags)
+#define DECLARE_XAM_EXPORT_(name, category, tags) \
+  DECLARE_EXPORT(xam, name, category, tags)
+#define DECLARE_XAM_EXPORT1(name, category, tag) \
+  DECLARE_EXPORT(xam, name, category, xe::cpu::ExportTag::tag)
+#define DECLARE_XAM_EXPORT2(name, category, tag1, tag2) \
+  DECLARE_EXPORT(xam, name, category,                   \
+                 xe::cpu::ExportTag::tag1 | xe::cpu::ExportTag::tag2)
 
-// Exported from kernel_state.cc.
-KernelState* kernel_state();
-inline Memory* kernel_memory() { return kernel_state()->memory(); }
+#define DECLARE_XBDM_EXPORT_(name, category, tags) \
+  DECLARE_EXPORT(xbdm, name, category, tags)
+#define DECLARE_XBDM_EXPORT1(name, category, tag) \
+  DECLARE_EXPORT(xbdm, name, category, xe::cpu::ExportTag::tag)
+
+#define DECLARE_XBOXKRNL_EXPORT_(name, category, tags) \
+  DECLARE_EXPORT(xboxkrnl, name, category, tags)
+#define DECLARE_XBOXKRNL_EXPORT1(name, category, tag) \
+  DECLARE_EXPORT(xboxkrnl, name, category, xe::cpu::ExportTag::tag)
+#define DECLARE_XBOXKRNL_EXPORT2(name, category, tag1, tag2) \
+  DECLARE_EXPORT(xboxkrnl, name, category,                   \
+                 xe::cpu::ExportTag::tag1 | xe::cpu::ExportTag::tag2)
+#define DECLARE_XBOXKRNL_EXPORT3(name, category, tag1, tag2, tag3)     \
+  DECLARE_EXPORT(xboxkrnl, name, category,                             \
+                 xe::cpu::ExportTag::tag1 | xe::cpu::ExportTag::tag2 | \
+                     xe::cpu::ExportTag::tag3)
+#define DECLARE_XBOXKRNL_EXPORT4(name, category, tag1, tag2, tag3, tag4) \
+  DECLARE_EXPORT(xboxkrnl, name, category,                               \
+                 xe::cpu::ExportTag::tag1 | xe::cpu::ExportTag::tag2 |   \
+                     xe::cpu::ExportTag::tag3 | xe::cpu::ExportTag::tag4)
 
 }  // namespace kernel
 }  // namespace xe

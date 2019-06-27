@@ -22,6 +22,13 @@
 #include "xenia/base/platform_win.h"
 #include "xenia/base/string.h"
 
+#include "third_party/xbyak/xbyak/xbyak_util.h"
+
+#include <bcrypt.h>
+
+DEFINE_bool(win32_high_freq, true,
+            "Requests high performance from the NT kernel");
+
 namespace xe {
 
 bool has_console_attached_ = true;
@@ -52,6 +59,31 @@ void AttachConsole() {
   setvbuf(stderr, nullptr, _IONBF, 0);
 }
 
+static void RequestHighPerformance() {
+#if XE_PLATFORM_WIN32
+  NTSTATUS(*NtQueryTimerResolution)
+  (OUT PULONG MinimumResolution, OUT PULONG MaximumResolution,
+   OUT PULONG CurrentResolution);
+
+  NTSTATUS(*NtSetTimerResolution)
+  (IN ULONG DesiredResolution, IN BOOLEAN SetResolution,
+   OUT PULONG CurrentResolution);
+
+  NtQueryTimerResolution = (decltype(NtQueryTimerResolution))GetProcAddress(
+      GetModuleHandle(L"ntdll.dll"), "NtQueryTimerResolution");
+  NtSetTimerResolution = (decltype(NtSetTimerResolution))GetProcAddress(
+      GetModuleHandle(L"ntdll.dll"), "NtSetTimerResolution");
+  if (!NtQueryTimerResolution || !NtSetTimerResolution) {
+    return;
+  }
+
+  ULONG minimum_resolution, maximum_resolution, current_resolution;
+  NtQueryTimerResolution(&minimum_resolution, &maximum_resolution,
+                         &current_resolution);
+  NtSetTimerResolution(maximum_resolution, TRUE, &current_resolution);
+#endif
+}
+
 int Main() {
   auto entry_info = xe::GetEntryInfo();
 
@@ -72,8 +104,8 @@ int Main() {
   int argca = argc;
   char** argva = reinterpret_cast<char**>(alloca(sizeof(char*) * argca));
   for (int n = 0; n < argca; n++) {
-    size_t len = wcslen(argv[n]);
-    argva[n] = reinterpret_cast<char*>(alloca(len + 1));
+    size_t len = std::wcstombs(nullptr, argv[n], 0);
+    argva[n] = reinterpret_cast<char*>(alloca(sizeof(char) * (len + 1)));
     std::wcstombs(argva[n], argv[n], len + 1);
   }
 
@@ -83,23 +115,42 @@ int Main() {
   // Widen all remaining flags and convert to usable strings.
   std::vector<std::wstring> args;
   for (int n = 0; n < argc; n++) {
-    args.push_back(xe::to_wstring(argva[n]));
+    size_t len = std::mbstowcs(nullptr, argva[n], 0);
+    auto argvw =
+        reinterpret_cast<wchar_t*>(alloca(sizeof(wchar_t) * (len + 1)));
+    std::mbstowcs(argvw, argva[n], len + 1);
+    args.push_back(std::wstring(argvw));
   }
 
   // Setup COM on the main thread.
   // NOTE: this may fail if COM has already been initialized - that's OK.
+#pragma warning(suppress : 6031)
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
   // Initialize logging. Needs parsed FLAGS.
   xe::InitializeLogging(entry_info.name);
 
+  Xbyak::util::Cpu cpu;
+  if (!cpu.has(Xbyak::util::Cpu::tAVX)) {
+    xe::FatalError(
+        "Your CPU does not support AVX, which is required by Xenia. See the "
+        "FAQ for system requirements at https://xenia.jp");
+    return -1;
+  }
+
   // Print version info.
   XELOGI("Build: %s / %s on %s", XE_BUILD_BRANCH, XE_BUILD_COMMIT,
          XE_BUILD_DATE);
 
+  // Request high performance timing.
+  if (FLAGS_win32_high_freq) {
+    RequestHighPerformance();
+  }
+
   // Call app-provided entry point.
   int result = entry_info.entry_point(args);
 
+  xe::ShutdownLogging();
   google::ShutDownCommandLineFlags();
   LocalFree(argv);
   return result;

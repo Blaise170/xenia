@@ -61,7 +61,7 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info,
 
     entry = file_->entry()->IterateChildren(find_engine_, &find_index_);
     if (!entry) {
-      return X_STATUS_NO_SUCH_FILE;
+      return X_STATUS_NO_MORE_FILES;
     }
   }
 
@@ -146,6 +146,8 @@ X_STATUS XFile::Write(const void* buffer, size_t buffer_length,
   async_event_->Set();
   return result;
 }
+
+X_STATUS XFile::SetLength(size_t length) { return file_->SetLength(length); }
 
 void XFile::RegisterIOCompletionPort(uint32_t key,
                                      object_ref<XIOCompletion> port) {

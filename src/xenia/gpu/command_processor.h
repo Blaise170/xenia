@@ -47,6 +47,8 @@ struct SwapState {
   uintptr_t front_buffer_texture = 0;
   // Current back buffer, being updated by the CP.
   uintptr_t back_buffer_texture = 0;
+  // Backend data
+  void* backend_data = nullptr;
   // Whether the back buffer is dirty and a swap is pending.
   bool pending = false;
 };
@@ -54,6 +56,50 @@ struct SwapState {
 enum class SwapMode {
   kNormal,
   kIgnored,
+};
+
+enum class GammaRampType {
+  kUnknown = 0,
+  kNormal,
+  kPWL,
+};
+
+struct GammaRamp {
+  struct NormalEntry {
+    union {
+      struct {
+        uint32_t r : 10;
+        uint32_t g : 10;
+        uint32_t b : 10;
+        uint32_t : 2;
+      };
+      uint32_t value;
+    };
+  };
+
+  struct PWLValue {
+    union {
+      struct {
+        uint16_t base;
+        uint16_t delta;
+      };
+      uint32_t value;
+    };
+  };
+
+  struct PWLEntry {
+    union {
+      struct {
+        PWLValue r;
+        PWLValue g;
+        PWLValue b;
+      };
+      PWLValue values[3];
+    };
+  };
+
+  NormalEntry normal[256];
+  PWLEntry pwl[128];
 };
 
 class CommandProcessor {
@@ -84,9 +130,9 @@ class CommandProcessor {
     swap_request_handler_ = fn;
   }
 
-  void RequestFrameTrace(const std::wstring& root_path);
-  void BeginTracing(const std::wstring& root_path);
-  void EndTracing();
+  virtual void RequestFrameTrace(const std::wstring& root_path);
+  virtual void BeginTracing(const std::wstring& root_path);
+  virtual void EndTracing();
 
   void InitializeRingBuffer(uint32_t ptr, uint32_t page_count);
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size);
@@ -115,7 +161,9 @@ class CommandProcessor {
   virtual bool SetupContext() = 0;
   virtual void ShutdownContext() = 0;
 
-  void WriteRegister(uint32_t index, uint32_t value);
+  virtual void WriteRegister(uint32_t index, uint32_t value);
+
+  void UpdateGammaRampValue(GammaRampType type, uint32_t value);
 
   virtual void MakeCoherent();
   virtual void PrepareForWait();
@@ -157,6 +205,8 @@ class CommandProcessor {
                                           uint32_t count);
   bool ExecutePacketType3_EVENT_WRITE_EXT(RingBuffer* reader, uint32_t packet,
                                           uint32_t count);
+  bool ExecutePacketType3_EVENT_WRITE_ZPD(RingBuffer* reader, uint32_t packet,
+                                          uint32_t count);
   bool ExecutePacketType3_DRAW_INDX(RingBuffer* reader, uint32_t packet,
                                     uint32_t count);
   bool ExecutePacketType3_DRAW_INDX_2(RingBuffer* reader, uint32_t packet,
@@ -176,6 +226,8 @@ class CommandProcessor {
                                             uint32_t packet, uint32_t count);
   bool ExecutePacketType3_INVALIDATE_STATE(RingBuffer* reader, uint32_t packet,
                                            uint32_t count);
+  bool ExecutePacketType3_VIZ_QUERY(RingBuffer* reader, uint32_t packet,
+                                    uint32_t count);
 
   virtual Shader* LoadShader(ShaderType shader_type, uint32_t guest_address,
                              const uint32_t* host_address,
@@ -209,6 +261,9 @@ class CommandProcessor {
   std::function<void()> swap_request_handler_;
   std::queue<std::function<void()>> pending_fns_;
 
+  // MicroEngine binary from PM4_ME_INIT
+  std::vector<uint32_t> me_bin_;
+
   uint32_t counter_ = 0;
 
   uint32_t primary_buffer_ptr_ = 0;
@@ -228,6 +283,11 @@ class CommandProcessor {
   Shader* active_pixel_shader_ = nullptr;
 
   bool paused_ = false;
+
+  GammaRamp gamma_ramp_ = {};
+  int gamma_ramp_rw_subindex_ = 0;
+  bool dirty_gamma_ramp_normal_ = true;
+  bool dirty_gamma_ramp_pwl_ = true;
 };
 
 }  // namespace gpu

@@ -15,7 +15,6 @@
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
-#include "xenia/kernel/util/xex2.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/xbox.h"
@@ -328,7 +327,19 @@ int32_t format_core(PPCContext* ppc_context, FormatData& data, ArgList& args,
 
           // character
           case 'c': {
-            bool is_wide = ((flags & (FF_IsLong | FF_IsWide)) != 0) ^ wide;
+            bool is_wide;
+            if (flags & FF_IsLong) {
+              // "An lc, lC, wc or wC type specifier is synonymous with C in
+              // printf functions and with c in wprintf functions."
+              is_wide = true;
+            } else if (flags & FF_IsShort) {
+              // "An hc or hC type specifier is synonymous with c in printf
+              // functions and with C in wprintf functions."
+              is_wide = false;
+            } else {
+              is_wide = ((flags & FF_IsWide) != 0) ^ wide;
+            }
+
             auto value = args.get32();
 
             if (!is_wide) {
@@ -531,18 +542,28 @@ int32_t format_core(PPCContext* ppc_context, FormatData& data, ArgList& args,
               text.is_wide = false;
             } else {
               void* str = SHIM_MEM_ADDR(pointer);
-              bool is_wide = ((flags & (FF_IsLong | FF_IsWide)) != 0) ^ wide;
+              bool is_wide;
+              if (flags & FF_IsLong) {
+                // "An ls, lS, ws or wS type specifier is synonymous with S in
+                // printf functions and with s in wprintf functions."
+                is_wide = true;
+              } else if (flags & FF_IsShort) {
+                // "An hs or hS type specifier is synonymous with s in printf
+                // functions and with S in wprintf functions."
+                is_wide = false;
+              } else {
+                is_wide = ((flags & (FF_IsWide)) != 0) ^ wide;
+              }
               int32_t length;
 
               if (!is_wide) {
                 length = 0;
-                for (auto s = (const uint8_t *)str; cap > 0 && *s; ++s, cap--) {
+                for (auto s = (const uint8_t*)str; cap > 0 && *s; ++s, cap--) {
                   length++;
                 }
               } else {
                 length = 0;
-                for (auto s = (const uint16_t *)str; cap > 0 && *s;
-                     ++s, cap--) {
+                for (auto s = (const uint16_t*)str; cap > 0 && *s; ++s, cap--) {
                   length++;
                 }
               }
@@ -557,6 +578,7 @@ int32_t format_core(PPCContext* ppc_context, FormatData& data, ArgList& args,
           // ANSI_STRING / UNICODE_STRING
           case 'Z': {
             assert_always();
+            break;
           }
 
           default: { assert_always(); }
@@ -882,6 +904,43 @@ SHIM_CALL sprintf_shim(PPCContext* ppc_context, KernelState* kernel_state) {
   SHIM_SET_RETURN_32(count);
 }
 
+// https://msdn.microsoft.com/en-us/library/2ts7cx93.aspx
+SHIM_CALL _snwprintf_shim(PPCContext* ppc_context, KernelState* kernel_state) {
+  uint32_t buffer_ptr = SHIM_GET_ARG_32(0);
+  int32_t buffer_count = SHIM_GET_ARG_32(1);
+  uint32_t format_ptr = SHIM_GET_ARG_32(2);
+
+  XELOGD("_snwprintf(%08X, %i, %08X, ...)", buffer_ptr, buffer_count,
+         format_ptr);
+
+  if (buffer_ptr == 0 || buffer_count <= 0 || format_ptr == 0) {
+    SHIM_SET_RETURN_32(-1);
+    return;
+  }
+
+  auto buffer = (uint16_t*)SHIM_MEM_ADDR(buffer_ptr);
+  auto format = (const uint16_t*)SHIM_MEM_ADDR(format_ptr);
+
+  StackArgList args(ppc_context, 3);
+  WideStringFormatData data(format);
+
+  int32_t count = format_core(ppc_context, data, args, true);
+  if (count < 0) {
+    if (buffer_count > 0) {
+      buffer[0] = '\0';  // write a null, just to be safe
+    }
+  } else if (count <= buffer_count) {
+    xe::copy_and_swap(buffer, (uint16_t*)data.wstr().c_str(), count);
+    if (count < buffer_count) {
+      buffer[count] = '\0';
+    }
+  } else {
+    xe::copy_and_swap(buffer, (uint16_t*)data.wstr().c_str(), buffer_count);
+    count = -1;  // for return value
+  }
+  SHIM_SET_RETURN_32(count);
+}
+
 // https://msdn.microsoft.com/en-us/library/ybk95axf.aspx
 SHIM_CALL swprintf_shim(PPCContext* ppc_context, KernelState* kernel_state) {
   uint32_t buffer_ptr = SHIM_GET_ARG_32(0);
@@ -946,6 +1005,46 @@ SHIM_CALL _vsnprintf_shim(PPCContext* ppc_context, KernelState* kernel_state) {
   } else {
     // Overflowed buffer. We still return the count we would have written.
     std::memcpy(buffer, data.str().c_str(), buffer_count);
+  }
+  SHIM_SET_RETURN_32(count);
+}
+
+// https://msdn.microsoft.com/en-us/library/1kt27hek.aspx
+SHIM_CALL _vsnwprintf_shim(PPCContext* ppc_context, KernelState* kernel_state) {
+  uint32_t buffer_ptr = SHIM_GET_ARG_32(0);
+  int32_t buffer_count = SHIM_GET_ARG_32(1);
+  uint32_t format_ptr = SHIM_GET_ARG_32(2);
+  uint32_t arg_ptr = SHIM_GET_ARG_32(3);
+
+  XELOGD("_vsnwprintf(%08X, %i, %08X, %08X)", buffer_ptr, buffer_count,
+         format_ptr, arg_ptr);
+
+  if (buffer_ptr == 0 || buffer_count <= 0 || format_ptr == 0) {
+    SHIM_SET_RETURN_32(-1);
+    return;
+  }
+
+  auto buffer = (uint16_t*)SHIM_MEM_ADDR(buffer_ptr);
+  auto format = (const uint16_t*)SHIM_MEM_ADDR(format_ptr);
+
+  ArrayArgList args(ppc_context, arg_ptr);
+  WideStringFormatData data(format);
+
+  int32_t count = format_core(ppc_context, data, args, true);
+  if (count < 0) {
+    // Error.
+    if (buffer_count > 0) {
+      buffer[0] = '\0';  // write a null, just to be safe
+    }
+  } else if (count <= buffer_count) {
+    // Fit within the buffer.
+    xe::copy_and_swap(buffer, (uint16_t*)data.wstr().c_str(), count);
+    if (count < buffer_count) {
+      buffer[count] = '\0';
+    }
+  } else {
+    // Overflowed buffer. We still return the count we would have written.
+    xe::copy_and_swap(buffer, (uint16_t*)data.wstr().c_str(), buffer_count);
   }
   SHIM_SET_RETURN_32(count);
 }
@@ -1035,11 +1134,13 @@ void RegisterStringExports(xe::cpu::ExportResolver* export_resolver,
   SHIM_SET_MAPPING("xboxkrnl.exe", DbgPrint, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", _snprintf, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", sprintf, state);
+  SHIM_SET_MAPPING("xboxkrnl.exe", _snwprintf, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", swprintf, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", _vsnprintf, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", vsprintf, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", _vscwprintf, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", vswprintf, state);
+  SHIM_SET_MAPPING("xboxkrnl.exe", _vsnwprintf, state);
 }
 
 }  // namespace xboxkrnl

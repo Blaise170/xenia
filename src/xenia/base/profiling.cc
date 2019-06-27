@@ -91,8 +91,8 @@ void Profiler::Dump() {
 #if XE_OPTION_PROFILING_UI
   MicroProfileDumpTimers();
 #endif  // XE_OPTION_PROFILING_UI
-  MicroProfileDumpHtml("profile.html");
-  MicroProfileDumpHtmlToFile();
+  // MicroProfileDumpHtml("profile.html");
+  // MicroProfileDumpHtmlToFile();
 }
 
 void Profiler::Shutdown() {
@@ -114,7 +114,7 @@ void Profiler::ThreadEnter(const char* name) {
 void Profiler::ThreadExit() { MicroProfileOnThreadExit(); }
 
 bool Profiler::OnKeyDown(int key_code) {
-  // http://msdn.microsoft.com/en-us/library/windows/desktop/dd375731(v=vs.85).aspx
+  // https://msdn.microsoft.com/en-us/library/windows/desktop/dd375731(v=vs.85).aspx
   switch (key_code) {
     case VK_OEM_3:  // `
       MicroProfileTogglePause();
@@ -236,16 +236,17 @@ void Profiler::set_window(ui::Window* window) {
 
 void Profiler::Present() {
   SCOPE_profile_cpu_f("internal");
-  MicroProfileFlip();
 #if XE_OPTION_PROFILING_UI
   if (!window_ || !drawer_) {
     return;
   }
   drawer_->Begin();
-  MicroProfileDraw(window_->width(), window_->height());
+  MicroProfileDraw(window_->scaled_width(), window_->scaled_height());
   drawer_->End();
 #endif  // XE_OPTION_PROFILING_UI
 }
+
+void Profiler::Flip() { MicroProfileFlip(); }
 
 #else
 
@@ -267,16 +268,13 @@ void Profiler::ToggleDisplay() {}
 void Profiler::TogglePause() {}
 void Profiler::set_window(ui::Window* window) {}
 void Profiler::Present() {}
+void Profiler::Flip() {}
 
 #endif  // XE_OPTION_PROFILING
 
 }  // namespace xe
 
 uint32_t MicroProfileGpuInsertTimeStamp() { return 0; }
-
-uint64_t MicroProfileGpuGetTimeStamp(uint32_t nKey) { return 0; }
-
-uint64_t MicroProfileTicksPerSecondGpu() { return 0; }
 
 const char* MicroProfileGetThreadName() { return "TODO: get thread name!"; }
 

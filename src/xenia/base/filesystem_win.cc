@@ -8,13 +8,36 @@
  */
 
 #include "xenia/base/filesystem.h"
+#include "xenia/base/logging.h"
 
 #include <string>
+
+#include <shlobj.h>
 
 #include "xenia/base/platform_win.h"
 
 namespace xe {
 namespace filesystem {
+
+std::wstring GetExecutablePath() {
+  wchar_t* path;
+  auto error = _get_wpgmptr(&path);
+  return !error ? std::wstring(path) : std::wstring();
+}
+
+std::wstring GetExecutableFolder() {
+  auto path = GetExecutablePath();
+  return xe::find_base_path(path);
+}
+
+std::wstring GetUserFolder() {
+  wchar_t path[MAX_PATH];
+  if (!SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_MYDOCUMENTS, nullptr,
+                                  SHGFP_TYPE_CURRENT, path))) {
+    return std::wstring();
+  }
+  return std::wstring(path);
+}
 
 bool PathExists(const std::wstring& path) {
   DWORD attrib = GetFileAttributes(path.c_str());
@@ -33,7 +56,7 @@ bool CreateFolder(const std::wstring& path) {
 }
 
 bool DeleteFolder(const std::wstring& path) {
-  auto double_null_path = path + L"\0";
+  auto double_null_path = path + std::wstring(L"\0", 1);
   SHFILEOPSTRUCT op = {0};
   op.wFunc = FO_DELETE;
   op.pFrom = double_null_path.c_str();
@@ -89,6 +112,12 @@ class Win32FileHandle : public FileHandle {
       *out_bytes_read = bytes_read;
       return true;
     } else {
+      if (GetLastError() == ERROR_NOACCESS) {
+        XELOGW(
+            "Win32FileHandle::Read(..., %.8llX, %.8llX, ...) returned "
+            "ERROR_NOACCESS. Read-only memory?",
+            buffer, buffer_length);
+      }
       return false;
     }
   }
@@ -107,6 +136,17 @@ class Win32FileHandle : public FileHandle {
     } else {
       return false;
     }
+  }
+  bool SetLength(size_t length) {
+    LARGE_INTEGER position;
+    position.QuadPart = length;
+    if (!SetFilePointerEx(handle_, position, nullptr, SEEK_SET)) {
+      return false;
+    }
+    if (!SetEndOfFile(handle_)) {
+      return false;
+    }
+    return true;
   }
   void Flush() override { FlushFileBuffers(handle_); }
 
@@ -167,6 +207,7 @@ bool GetInfo(const std::wstring& path, FileInfo* out_info) {
     out_info->total_size =
         (data.nFileSizeHigh * (size_t(MAXDWORD) + 1)) + data.nFileSizeLow;
   }
+  out_info->path = xe::find_base_path(path);
   out_info->name = xe::find_name_from_path(path);
   out_info->create_timestamp = COMBINE_TIME(data.ftCreationTime);
   out_info->access_timestamp = COMBINE_TIME(data.ftLastAccessTime);
@@ -196,6 +237,7 @@ std::vector<FileInfo> ListFiles(const std::wstring& path) {
       info.total_size =
           (ffd.nFileSizeHigh * (size_t(MAXDWORD) + 1)) + ffd.nFileSizeLow;
     }
+    info.path = path;
     info.name = ffd.cFileName;
     info.create_timestamp = COMBINE_TIME(ffd.ftCreationTime);
     info.access_timestamp = COMBINE_TIME(ffd.ftLastAccessTime);

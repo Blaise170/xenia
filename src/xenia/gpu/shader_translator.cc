@@ -1,3 +1,4 @@
+#include "shader_translator.h"
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -13,6 +14,7 @@
 #include <set>
 #include <string>
 
+#include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 
 namespace xe {
@@ -38,7 +40,7 @@ using namespace ucode;
 // https://github.com/freedreno/freedreno/blob/master/util/disasm-a2xx.c
 //
 // Lots of naming comes from the disassembly spit out by the XNA GS compiler
-// and dumps of d3dcompiler and games: http://pastebin.com/i4kAv7bB
+// and dumps of d3dcompiler and games: https://pastebin.com/i4kAv7bB
 
 ShaderTranslator::ShaderTranslator() = default;
 
@@ -49,17 +51,68 @@ void ShaderTranslator::Reset() {
   ucode_disasm_buffer_.Reset();
   ucode_disasm_line_number_ = 0;
   previous_ucode_disasm_scan_offset_ = 0;
+  register_count_ = 64;
   total_attrib_count_ = 0;
   vertex_bindings_.clear();
+  unique_vertex_bindings_ = 0;
   texture_bindings_.clear();
+  unique_texture_bindings_ = 0;
+  std::memset(&constant_register_map_, 0, sizeof(constant_register_map_));
   for (size_t i = 0; i < xe::countof(writes_color_targets_); ++i) {
     writes_color_targets_[i] = false;
   }
 }
 
-bool ShaderTranslator::Translate(Shader* shader) {
+bool ShaderTranslator::GatherAllBindingInformation(Shader* shader) {
+  // DEPRECATED: remove this codepath when GL4 goes away.
   Reset();
 
+  shader_type_ = shader->type();
+  ucode_dwords_ = shader->ucode_dwords();
+  ucode_dword_count_ = shader->ucode_dword_count();
+
+  uint32_t max_cf_dword_index = static_cast<uint32_t>(ucode_dword_count_);
+  for (uint32_t i = 0; i < max_cf_dword_index; i += 3) {
+    ControlFlowInstruction cf_a;
+    ControlFlowInstruction cf_b;
+    UnpackControlFlowInstructions(ucode_dwords_ + i, &cf_a, &cf_b);
+    if (IsControlFlowOpcodeExec(cf_a.opcode())) {
+      max_cf_dword_index =
+          std::min(max_cf_dword_index, cf_a.exec.address() * 3);
+    }
+    if (IsControlFlowOpcodeExec(cf_b.opcode())) {
+      max_cf_dword_index =
+          std::min(max_cf_dword_index, cf_b.exec.address() * 3);
+    }
+
+    GatherBindingInformation(cf_a);
+    GatherBindingInformation(cf_b);
+  }
+
+  shader->vertex_bindings_ = std::move(vertex_bindings_);
+  shader->texture_bindings_ = std::move(texture_bindings_);
+  for (size_t i = 0; i < xe::countof(writes_color_targets_); ++i) {
+    shader->writes_color_targets_[i] = writes_color_targets_[i];
+  }
+
+  return true;
+}
+
+bool ShaderTranslator::Translate(Shader* shader,
+                                 xenos::xe_gpu_program_cntl_t cntl) {
+  Reset();
+  register_count_ = shader->type() == ShaderType::kVertex ? cntl.vs_regs + 1
+                                                          : cntl.ps_regs + 1;
+
+  return TranslateInternal(shader);
+}
+
+bool ShaderTranslator::Translate(Shader* shader) {
+  Reset();
+  return TranslateInternal(shader);
+}
+
+bool ShaderTranslator::TranslateInternal(Shader* shader) {
   shader_type_ = shader->type();
   ucode_dwords_ = shader->ucode_dwords();
   ucode_dword_count_ = shader->ucode_dword_count();
@@ -79,6 +132,7 @@ bool ShaderTranslator::Translate(Shader* shader) {
       max_cf_dword_index =
           std::min(max_cf_dword_index, cf_b.exec.address() * 3);
     }
+
     GatherBindingInformation(cf_a);
     GatherBindingInformation(cf_b);
   }
@@ -87,22 +141,44 @@ bool ShaderTranslator::Translate(Shader* shader) {
 
   TranslateBlocks();
 
+  // Compute total bytes used by the register map.
+  // This saves us work later when we need to pack them.
+  constant_register_map_.packed_byte_length = 0;
+  for (int i = 0; i < 4; ++i) {
+    // Each bit indicates a vec4 (4 floats).
+    constant_register_map_.packed_byte_length +=
+        4 * 4 * xe::bit_count(constant_register_map_.float_bitmap[i]);
+  }
+  // Each bit indicates a single word.
+  constant_register_map_.packed_byte_length +=
+      4 * xe::bit_count(constant_register_map_.int_bitmap);
+  // Direct map between words and words we upload.
+  for (int i = 0; i < 8; ++i) {
+    if (constant_register_map_.bool_bitmap[i]) {
+      constant_register_map_.packed_byte_length += 4;
+    }
+  }
+
   shader->errors_ = std::move(errors_);
   shader->translated_binary_ = CompleteTranslation();
   shader->ucode_disassembly_ = ucode_disasm_buffer_.to_string();
   shader->vertex_bindings_ = std::move(vertex_bindings_);
   shader->texture_bindings_ = std::move(texture_bindings_);
+  shader->constant_register_map_ = std::move(constant_register_map_);
   for (size_t i = 0; i < xe::countof(writes_color_targets_); ++i) {
     shader->writes_color_targets_[i] = writes_color_targets_[i];
   }
 
   shader->is_valid_ = true;
+  shader->is_translated_ = true;
   for (const auto& error : shader->errors_) {
     if (error.is_fatal) {
       shader->is_valid_ = false;
       break;
     }
   }
+
+  PostTranslation(shader);
 
   return shader->is_valid_;
 }
@@ -183,14 +259,12 @@ void ShaderTranslator::GatherBindingInformation(
           // Gather up color targets written to.
           auto& op = *reinterpret_cast<const AluInstruction*>(ucode_dwords_ +
                                                               instr_offset * 3);
-          if (op.has_vector_op() && op.is_export()) {
-            if (op.vector_dest() <= 3) {
+          if (op.is_export()) {
+            if (op.has_vector_op() && op.vector_dest() <= 3) {
               writes_color_targets_[op.vector_dest()] = true;
             }
-          }
-          if (op.has_scalar_op() && op.is_export()) {
-            if (op.vector_dest() <= 3) {
-              writes_color_targets_[op.vector_dest()] = true;
+            if (op.has_scalar_op() && op.scalar_dest() <= 3) {
+              writes_color_targets_[op.scalar_dest()] = true;
             }
           }
         }
@@ -228,7 +302,7 @@ void ShaderTranslator::GatherVertexBindingInformation(
   if (!attrib) {
     assert_not_zero(fetch_instr.attributes.stride);
     VertexBinding vertex_binding;
-    vertex_binding.binding_index = static_cast<int>(vertex_bindings_.size());
+    vertex_binding.binding_index = int(vertex_bindings_.size());
     vertex_binding.fetch_constant = op.fetch_constant_index();
     vertex_binding.stride_words = fetch_instr.attributes.stride;
     vertex_binding.attributes.push_back({});
@@ -256,9 +330,23 @@ void ShaderTranslator::GatherTextureBindingInformation(
       break;
   }
   Shader::TextureBinding binding;
-  binding.binding_index = texture_bindings_.size();
+  binding.binding_index = -1;
   ParseTextureFetchInstruction(op, &binding.fetch_instr);
   binding.fetch_constant = binding.fetch_instr.operands[1].storage_index;
+
+  // Check and see if this fetch constant was previously used...
+  for (auto& tex_binding : texture_bindings_) {
+    if (tex_binding.fetch_constant == binding.fetch_constant) {
+      binding.binding_index = tex_binding.binding_index;
+      break;
+    }
+  }
+
+  if (binding.binding_index == -1) {
+    // Assign a unique binding index.
+    binding.binding_index = unique_texture_bindings_++;
+  }
+
   texture_bindings_.emplace_back(std::move(binding));
 }
 
@@ -294,6 +382,7 @@ bool ShaderTranslator::TranslateBlocks() {
   // This is what freedreno does.
   uint32_t max_cf_dword_index = static_cast<uint32_t>(ucode_dword_count_);
   std::set<uint32_t> label_addresses;
+  std::vector<ControlFlowInstruction> cf_instructions;
   for (uint32_t i = 0; i < max_cf_dword_index; i += 3) {
     ControlFlowInstruction cf_a;
     ControlFlowInstruction cf_b;
@@ -308,7 +397,12 @@ bool ShaderTranslator::TranslateBlocks() {
     }
     AddControlFlowTargetLabel(cf_a, &label_addresses);
     AddControlFlowTargetLabel(cf_b, &label_addresses);
+
+    cf_instructions.push_back(cf_a);
+    cf_instructions.push_back(cf_b);
   }
+
+  PreProcessControlFlowInstructions(cf_instructions);
 
   // Translate all instructions.
   for (uint32_t i = 0, cf_index = 0; i < max_cf_dword_index; i += 3) {
@@ -412,7 +506,7 @@ void ShaderTranslator::TranslateControlFlowNop(
     const ControlFlowInstruction& cf) {
   ucode_disasm_buffer_.Append("      cnop\n");
 
-  ProcessControlFlowNopInstruction();
+  ProcessControlFlowNopInstruction(cf_index_);
 }
 
 void ShaderTranslator::TranslateControlFlowExec(
@@ -451,6 +545,8 @@ void ShaderTranslator::TranslateControlFlowCondExec(
   i.instruction_count = cf.count();
   i.type = ParsedExecInstruction::Type::kConditional;
   i.bool_constant_index = cf.bool_address();
+  constant_register_map_.bool_bitmap[i.bool_constant_index / 32] |=
+      1 << (i.bool_constant_index % 32);
   i.condition = cf.condition();
   switch (cf.opcode()) {
     case ControlFlowOpcode::kCondExec:
@@ -490,6 +586,7 @@ void ShaderTranslator::TranslateControlFlowLoopStart(
   ParsedLoopStartInstruction i;
   i.dword_index = cf_index_;
   i.loop_constant_index = cf.loop_id();
+  constant_register_map_.int_bitmap |= 1 << i.loop_constant_index;
   i.is_repeat = cf.is_repeat();
   i.loop_skip_address = cf.address();
 
@@ -505,6 +602,7 @@ void ShaderTranslator::TranslateControlFlowLoopEnd(
   i.is_predicated_break = cf.is_predicated_break();
   i.predicate_condition = cf.condition();
   i.loop_constant_index = cf.loop_id();
+  constant_register_map_.int_bitmap |= 1 << i.loop_constant_index;
   i.loop_body_address = cf.address();
 
   i.Disassemble(&ucode_disasm_buffer_);
@@ -525,6 +623,8 @@ void ShaderTranslator::TranslateControlFlowCondCall(
   } else {
     i.type = ParsedCallInstruction::Type::kConditional;
     i.bool_constant_index = cf.bool_address();
+    constant_register_map_.bool_bitmap[i.bool_constant_index / 32] |=
+        1 << (i.bool_constant_index % 32);
     i.condition = cf.condition();
   }
 
@@ -556,6 +656,8 @@ void ShaderTranslator::TranslateControlFlowCondJmp(
   } else {
     i.type = ParsedJumpInstruction::Type::kConditional;
     i.bool_constant_index = cf.bool_address();
+    constant_register_map_.bool_bitmap[i.bool_constant_index / 32] |=
+        1 << (i.bool_constant_index % 32);
     i.condition = cf.condition();
   }
 
@@ -691,7 +793,7 @@ void ShaderTranslator::ParseVertexFetchInstruction(
   i.attributes.exp_adjust = op.exp_adjust();
   i.attributes.is_index_rounded = op.is_index_rounded();
   i.attributes.is_signed = op.is_signed();
-  i.attributes.is_integer = op.is_integer();
+  i.attributes.is_integer = !op.is_normalized();
   i.attributes.prefetch_count = op.prefetch_count();
 
   // Store for later use by mini fetches.
@@ -809,6 +911,7 @@ void ShaderTranslator::ParseTextureFetchInstruction(
     i.attributes.use_computed_lod = op.use_computed_lod();
     i.attributes.use_register_lod = op.use_register_lod();
     i.attributes.use_register_gradients = op.use_register_gradients();
+    i.attributes.lod_bias = op.lod_bias();
     i.attributes.offset_x = op.offset_x();
     i.attributes.offset_y = op.offset_y();
     i.attributes.offset_z = op.offset_z();
@@ -913,16 +1016,19 @@ void ShaderTranslator::TranslateAluInstruction(const AluInstruction& op) {
     return;
   }
 
+  ParsedAluInstruction instr;
   if (op.has_vector_op()) {
     const auto& opcode_info =
         alu_vector_opcode_infos_[static_cast<int>(op.vector_opcode())];
-    ParseAluVectorInstruction(op, opcode_info);
+    ParseAluVectorInstruction(op, opcode_info, instr);
+    ProcessAluInstruction(instr);
   }
 
   if (op.has_scalar_op()) {
     const auto& opcode_info =
         alu_scalar_opcode_infos_[static_cast<int>(op.scalar_opcode())];
-    ParseAluScalarInstruction(op, opcode_info);
+    ParseAluScalarInstruction(op, opcode_info, instr);
+    ProcessAluInstruction(instr);
   }
 }
 
@@ -968,15 +1074,16 @@ void ParseAluInstructionOperand(const AluInstruction& op, int i,
   out_op->component_count = swizzle_component_count;
   uint32_t swizzle = op.src_swizzle(i);
   if (swizzle_component_count == 1) {
-    uint32_t a = swizzle & 0x3;
+    uint32_t a = ((swizzle >> 6) + 3) & 0x3;
     out_op->components[0] = GetSwizzleFromComponentIndex(a);
   } else if (swizzle_component_count == 2) {
-    swizzle >>= 4;
-    uint32_t a = ((swizzle >> 2) + 3) & 0x3;
-    uint32_t b = (swizzle + 2) & 0x3;
+    uint32_t a = ((swizzle >> 6) + 3) & 0x3;
+    uint32_t b = ((swizzle >> 0) + 0) & 0x3;
     out_op->components[0] = GetSwizzleFromComponentIndex(a);
     out_op->components[1] = GetSwizzleFromComponentIndex(b);
-  } else {
+  } else if (swizzle_component_count == 3) {
+    assert_always();
+  } else if (swizzle_component_count == 4) {
     for (int j = 0; j < swizzle_component_count; ++j, swizzle >>= 2) {
       out_op->components[j] = GetSwizzleFromComponentIndex((swizzle + j) & 0x3);
     }
@@ -993,6 +1100,7 @@ void ParseAluInstructionOperandSpecial(const AluInstruction& op,
   out_op->storage_source = storage_source;
   if (storage_source == InstructionStorageSource::kRegister) {
     out_op->storage_index = reg & 0x7F;
+    out_op->storage_addressing_mode = InstructionStorageAddressingMode::kStatic;
   } else {
     out_op->storage_index = reg;
     if ((const_slot == 0 && op.is_const_0_addressed()) ||
@@ -1015,8 +1123,8 @@ void ParseAluInstructionOperandSpecial(const AluInstruction& op,
 }
 
 void ShaderTranslator::ParseAluVectorInstruction(
-    const AluInstruction& op, const AluOpcodeInfo& opcode_info) {
-  ParsedAluInstruction i;
+    const AluInstruction& op, const AluOpcodeInfo& opcode_info,
+    ParsedAluInstruction& i) {
   i.dword_index = 0;
   i.type = ParsedAluInstruction::Type::kVector;
   i.vector_opcode = op.vector_opcode();
@@ -1040,6 +1148,17 @@ void ShaderTranslator::ParseAluVectorInstruction(
             : InstructionStorageAddressingMode::kStatic;
   } else if (is_vertex_shader()) {
     switch (dest_num) {
+      case 32:
+        i.result.storage_target = InstructionStorageTarget::kExportAddress;
+        break;
+      case 33:
+      case 34:
+      case 35:
+      case 36:
+      case 37:
+        i.result.storage_index = dest_num - 33;
+        i.result.storage_target = InstructionStorageTarget::kExportData;
+        break;
       case 62:
         i.result.storage_target = InstructionStorageTarget::kPosition;
         break;
@@ -1047,9 +1166,19 @@ void ShaderTranslator::ParseAluVectorInstruction(
         i.result.storage_target = InstructionStorageTarget::kPointSize;
         break;
       default:
-        assert_true(dest_num < 16);
-        i.result.storage_target = InstructionStorageTarget::kInterpolant;
-        i.result.storage_index = dest_num;
+        if (dest_num < 16) {
+          i.result.storage_target = InstructionStorageTarget::kInterpolant;
+          i.result.storage_index = dest_num;
+        } else {
+          // Unimplemented.
+          // assert_always();
+          XELOGE(
+              "ShaderTranslator::ParseAluVectorInstruction: Unsupported write "
+              "to export %d",
+              dest_num);
+          i.result.storage_target = InstructionStorageTarget::kNone;
+          i.result.storage_index = 0;
+        }
         break;
     }
   } else if (is_pixel_shader()) {
@@ -1071,9 +1200,27 @@ void ShaderTranslator::ParseAluVectorInstruction(
         i.result.storage_target = InstructionStorageTarget::kColorTarget;
         i.result.storage_index = 3;
         break;
+      case 32:
+        i.result.storage_target = InstructionStorageTarget::kExportAddress;
+        break;
+      case 33:
+      case 34:
+      case 35:
+      case 36:
+      case 37:
+        i.result.storage_index = dest_num - 33;
+        i.result.storage_target = InstructionStorageTarget::kExportData;
+        break;
       case 61:
         i.result.storage_target = InstructionStorageTarget::kDepth;
         break;
+      default:
+        XELOGE(
+            "ShaderTranslator::ParseAluVectorInstruction: Unsupported write "
+            "to export %d",
+            dest_num);
+        i.result.storage_target = InstructionStorageTarget::kNone;
+        i.result.storage_index = 0;
     }
   }
   if (op.is_export()) {
@@ -1113,16 +1260,22 @@ void ShaderTranslator::ParseAluVectorInstruction(
   for (int j = 0; j < i.operand_count; ++j) {
     ParseAluInstructionOperand(
         op, j + 1, opcode_info.src_swizzle_component_count, &i.operands[j]);
+
+    // Track constant float register loads.
+    if (i.operands[j].storage_source ==
+        InstructionStorageSource::kConstantFloat) {
+      auto register_index = i.operands[j].storage_index;
+      constant_register_map_.float_bitmap[register_index / 64] |=
+          1ull << (register_index % 64);
+    }
   }
 
   i.Disassemble(&ucode_disasm_buffer_);
-
-  ProcessAluInstruction(i);
 }
 
 void ShaderTranslator::ParseAluScalarInstruction(
-    const AluInstruction& op, const AluOpcodeInfo& opcode_info) {
-  ParsedAluInstruction i;
+    const AluInstruction& op, const AluOpcodeInfo& opcode_info,
+    ParsedAluInstruction& i) {
   i.dword_index = 0;
   i.type = ParsedAluInstruction::Type::kScalar;
   i.scalar_opcode = op.scalar_opcode();
@@ -1154,6 +1307,17 @@ void ShaderTranslator::ParseAluScalarInstruction(
             : InstructionStorageAddressingMode::kStatic;
   } else if (is_vertex_shader()) {
     switch (dest_num) {
+      case 32:
+        i.result.storage_target = InstructionStorageTarget::kExportAddress;
+        break;
+      case 33:
+      case 34:
+      case 35:
+      case 36:
+      case 37:
+        i.result.storage_index = dest_num - 33;
+        i.result.storage_target = InstructionStorageTarget::kExportData;
+        break;
       case 62:
         i.result.storage_target = InstructionStorageTarget::kPosition;
         break;
@@ -1161,9 +1325,19 @@ void ShaderTranslator::ParseAluScalarInstruction(
         i.result.storage_target = InstructionStorageTarget::kPointSize;
         break;
       default:
-        assert_true(dest_num < 16);
-        i.result.storage_target = InstructionStorageTarget::kInterpolant;
-        i.result.storage_index = dest_num;
+        if (dest_num < 16) {
+          i.result.storage_target = InstructionStorageTarget::kInterpolant;
+          i.result.storage_index = dest_num;
+        } else {
+          // Unimplemented.
+          // assert_always();
+          XELOGE(
+              "ShaderTranslator::ParseAluScalarInstruction: Unsupported write "
+              "to export %d",
+              dest_num);
+          i.result.storage_target = InstructionStorageTarget::kNone;
+          i.result.storage_index = 0;
+        }
         break;
     }
   } else if (is_pixel_shader()) {
@@ -1185,6 +1359,17 @@ void ShaderTranslator::ParseAluScalarInstruction(
         i.result.storage_target = InstructionStorageTarget::kColorTarget;
         i.result.storage_index = 3;
         break;
+      case 32:
+        i.result.storage_target = InstructionStorageTarget::kExportAddress;
+        break;
+      case 33:
+      case 34:
+      case 35:
+      case 36:
+      case 37:
+        i.result.storage_index = dest_num - 33;
+        i.result.storage_target = InstructionStorageTarget::kExportData;
+        break;
       case 61:
         i.result.storage_target = InstructionStorageTarget::kDepth;
         break;
@@ -1201,22 +1386,28 @@ void ShaderTranslator::ParseAluScalarInstruction(
                                &i.operands[0]);
   } else {
     uint32_t src3_swizzle = op.src_swizzle(3);
-    uint32_t swiz_a = ((src3_swizzle >> 6) - 1) & 0x3;
-    uint32_t swiz_b = (src3_swizzle & 0x3);
-    uint32_t reg2 = (static_cast<int>(op.scalar_opcode()) & 1) |
-                    (src3_swizzle & 0x3C) | (op.src_is_temp(3) << 1);
+    uint32_t swiz_a = ((src3_swizzle >> 6) + 3) & 0x3;
+    uint32_t swiz_b = ((src3_swizzle >> 0) + 0) & 0x3;
+    uint32_t reg2 = (src3_swizzle & 0x3C) | (op.src_is_temp(3) << 1) |
+                    (static_cast<int>(op.scalar_opcode()) & 1);
+
     int const_slot = (op.src_is_temp(1) || op.src_is_temp(2)) ? 1 : 0;
+
     ParseAluInstructionOperandSpecial(
         op, InstructionStorageSource::kConstantFloat, op.src_reg(3),
         op.src_negate(3), 0, swiz_a, &i.operands[0]);
+
+    // Track constant float register loads.
+    auto register_index = i.operands[0].storage_index;
+    constant_register_map_.float_bitmap[register_index / 64] |=
+        1ull << (register_index % 64);
+
     ParseAluInstructionOperandSpecial(op, InstructionStorageSource::kRegister,
                                       reg2, op.src_negate(3), const_slot,
                                       swiz_b, &i.operands[1]);
   }
 
   i.Disassemble(&ucode_disasm_buffer_);
-
-  ProcessAluInstruction(i);
 }
 
 }  // namespace gpu
