@@ -10,8 +10,8 @@ project("xenia-app")
   links({
     "aes_128",
     "capstone",
-    "gflags",
-    "glew",
+    "dxbc",
+    "discord-rpc",
     "glslang-spirv",
     "imgui",
     "libavcodec",
@@ -20,8 +20,10 @@ project("xenia-app")
     "snappy",
     "spirv-tools",
     "volk",
+    "xenia-app-discord",
     "xenia-apu",
     "xenia-apu-nop",
+    "xenia-apu-sdl",
     "xenia-base",
     "xenia-core",
     "xenia-cpu",
@@ -29,12 +31,15 @@ project("xenia-app")
     "xenia-debug-ui",
     "xenia-gpu",
     "xenia-gpu-null",
+    "xenia-gpu-vk",
     "xenia-gpu-vulkan",
     "xenia-hid",
     "xenia-hid-nop",
+    "xenia-hid-sdl",
     "xenia-kernel",
     "xenia-ui",
     "xenia-ui-spirv",
+    "xenia-ui-vk",
     "xenia-ui-vulkan",
     "xenia-vfs",
     "xxhash",
@@ -42,9 +47,6 @@ project("xenia-app")
   defines({
     "XBYAK_NO_OP_NAMES",
     "XBYAK_ENABLE_OMITTED_OPERAND",
-  })
-  includedirs({
-    project_root.."/third_party/gflags/src",
   })
   local_platform_files()
   files({
@@ -70,15 +72,23 @@ project("xenia-app")
       "X11",
       "xcb",
       "X11-xcb",
-      "GL",
       "vulkan",
+      "SDL2",
     })
 
   filter("platforms:Windows")
     links({
+      "delayimp", -- This library implements delayed loading on Windows, an MSVC exclusive feature.
       "xenia-apu-xaudio2",
+      "xenia-gpu-d3d12",
       "xenia-hid-winkey",
       "xenia-hid-xinput",
+      "xenia-ui-d3d12",
+    })
+
+  filter("platforms:Windows")
+    linkoptions({
+      "/DELAYLOAD:SDL2.dll",  -- SDL is not mandatory on Windows, implementations using native APIs are prefered.
     })
 
   filter("platforms:Windows")
@@ -87,6 +97,5 @@ project("xenia-app")
     if not os.isfile(user_file) then
       debugdir(project_root)
       debugargs({
-        "--flagfile=scratch/flags.txt",
       })
     end

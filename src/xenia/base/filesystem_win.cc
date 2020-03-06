@@ -31,12 +31,14 @@ std::wstring GetExecutableFolder() {
 }
 
 std::wstring GetUserFolder() {
-  wchar_t path[MAX_PATH];
-  if (!SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_MYDOCUMENTS, nullptr,
-                                  SHGFP_TYPE_CURRENT, path))) {
-    return std::wstring();
+  std::wstring result;
+  PWSTR path;
+  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT,
+                                     nullptr, &path))) {
+    result.assign(path);
+    CoTaskMemFree(path);
   }
-  return std::wstring(path);
+  return result;
 }
 
 bool PathExists(const std::wstring& path) {
@@ -45,13 +47,11 @@ bool PathExists(const std::wstring& path) {
 }
 
 bool CreateFolder(const std::wstring& path) {
-  wchar_t folder[kMaxPath] = {0};
-  auto end = std::wcschr(path.c_str(), xe::kWPathSeparator);
-  while (end) {
-    wcsncpy(folder, path.c_str(), end - path.c_str() + 1);
-    CreateDirectory(folder, NULL);
-    end = wcschr(++end, xe::kWPathSeparator);
-  }
+  size_t pos = 0;
+  do {
+    pos = path.find_first_of(xe::kWPathSeparator, pos + 1);
+    CreateDirectoryW(path.substr(0, pos).c_str(), nullptr);
+  } while (pos != std::string::npos);
   return PathExists(path);
 }
 

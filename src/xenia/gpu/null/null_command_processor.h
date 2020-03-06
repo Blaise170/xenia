@@ -25,6 +25,10 @@ class NullCommandProcessor : public CommandProcessor {
                        kernel::KernelState* kernel_state);
   ~NullCommandProcessor();
 
+  void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
+
+  void RestoreEDRAMSnapshot(const void* snapshot) override;
+
  private:
   bool SetupContext() override;
   void ShutdownContext() override;
@@ -37,8 +41,12 @@ class NullCommandProcessor : public CommandProcessor {
                      uint32_t dword_count) override;
 
   bool IssueDraw(PrimitiveType prim_type, uint32_t index_count,
-                 IndexBufferInfo* index_buffer_info) override;
+                 IndexBufferInfo* index_buffer_info,
+                 bool major_mode_explicit) override;
   bool IssueCopy() override;
+
+  void InitializeTrace() override;
+  void FinalizeTrace() override;
 };
 
 }  // namespace null

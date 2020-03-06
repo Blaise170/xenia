@@ -50,7 +50,9 @@ class VulkanCommandProcessor : public CommandProcessor {
                          kernel::KernelState* kernel_state);
   ~VulkanCommandProcessor() override;
 
-  virtual void RequestFrameTrace(const std::wstring& root_path) override;
+  void RequestFrameTrace(const std::wstring& root_path) override;
+  void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
+  void RestoreEDRAMSnapshot(const void* snapshot) override;
   void ClearCaches() override;
 
   RenderCache* render_cache() { return render_cache_.get(); }
@@ -79,7 +81,8 @@ class VulkanCommandProcessor : public CommandProcessor {
                      uint32_t dword_count) override;
 
   bool IssueDraw(PrimitiveType primitive_type, uint32_t index_count,
-                 IndexBufferInfo* index_buffer_info) override;
+                 IndexBufferInfo* index_buffer_info,
+                 bool major_mode_explicit) override;
   bool PopulateConstants(VkCommandBuffer command_buffer,
                          VulkanShader* vertex_shader,
                          VulkanShader* pixel_shader);
@@ -93,6 +96,9 @@ class VulkanCommandProcessor : public CommandProcessor {
                         VulkanShader* vertex_shader,
                         VulkanShader* pixel_shader);
   bool IssueCopy() override;
+
+  void InitializeTrace() override;
+  void FinalizeTrace() override;
 
   xe::ui::vulkan::VulkanDevice* device_ = nullptr;
 

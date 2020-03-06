@@ -9,8 +9,6 @@
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_video.h"
 
-#include <gflags/gflags.h>
-
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/graphics_system.h"
@@ -24,9 +22,11 @@
 
 DEFINE_int32(kernel_display_gamma_type, 1,
              "Display gamma type: 0 - linear, 1 - sRGB, 2 - TV (BT.709), "
-             "3 - power specified via kernel_display_gamma_power.");
+             "3 - power specified via kernel_display_gamma_power.",
+             "Kernel");
 DEFINE_double(kernel_display_gamma_power, 2.22222233,
-              "Display gamma to use with kernel_display_gamma_type 3.");
+              "Display gamma to use with kernel_display_gamma_type 3.",
+              "Kernel");
 
 namespace xe {
 namespace kernel {
@@ -51,8 +51,8 @@ void VdGetCurrentDisplayGamma(lpdword_t type_ptr, lpfloat_t power_ptr) {
   // 3 - use the power written to *power_ptr.
   // Anything else - linear.
   // Used in D3D SetGammaRamp/SetPWLGamma to adjust the ramp for the display.
-  *type_ptr = uint32_t(FLAGS_kernel_display_gamma_type);
-  *power_ptr = float(FLAGS_kernel_display_gamma_power);
+  *type_ptr = uint32_t(cvars::kernel_display_gamma_type);
+  *power_ptr = float(cvars::kernel_display_gamma_power);
 }
 DECLARE_XBOXKRNL_EXPORT1(VdGetCurrentDisplayGamma, kVideo, kStub);
 
@@ -362,13 +362,26 @@ void VdSwap(lpvoid_t buffer_ptr,  // ptr into primary ringbuffer
   xe::copy_and_swap_32_unaligned(
       &fetch, reinterpret_cast<uint32_t*>(fetch_ptr.host_address()), 6);
 
+  // Kernel virtual -> GPU physical.
+  uint32_t frontbuffer_address = fetch.base_address << 12;
+  assert_true(*frontbuffer_ptr == frontbuffer_address);
+  frontbuffer_address =
+      kernel_memory()->GetPhysicalAddress(frontbuffer_address);
+  assert_true(frontbuffer_address != UINT32_MAX);
+  if (frontbuffer_address == UINT32_MAX) {
+    // Xenia-specific safety check.
+    XELOGE("VdSwap: Invalid front buffer virtual address 0x%.8X",
+           fetch.base_address << 12);
+    return;
+  }
+  fetch.base_address = frontbuffer_address >> 12;
+
   auto texture_format = gpu::TextureFormat(texture_format_ptr.value());
   auto color_space = *color_space_ptr;
   assert_true(texture_format == gpu::TextureFormat::k_8_8_8_8 ||
               texture_format ==
                   gpu::TextureFormat::k_2_10_10_10_AS_16_16_16_16);
   assert_true(color_space == 0);  // RGB(0)
-  assert_true(*frontbuffer_ptr == fetch.base_address << 12);
   assert_true(*width == 1 + fetch.size_2d.width);
   assert_true(*height == 1 + fetch.size_2d.height);
 
@@ -378,14 +391,6 @@ void VdSwap(lpvoid_t buffer_ptr,  // ptr into primary ringbuffer
   // that we could simulate it, though due to TCR I bet all games need to
   // use this method.
   buffer_ptr.Zero(64 * 4);
-
-  // virtual -> physical
-  // Doom 3: BFG Edition uses front buffers from the 0xE0000000 range with 4 KB
-  // offset, so & 0x1FFFF is not enough for this.
-  fetch.base_address = kernel_memory()
-                           ->LookupHeap(fetch.base_address << 12)
-                           ->GetPhysicalAddress(fetch.base_address << 12) >>
-                       12;
 
   uint32_t offset = 0;
   auto dwords = buffer_ptr.as_array<uint32_t>();
@@ -402,9 +407,7 @@ void VdSwap(lpvoid_t buffer_ptr,  // ptr into primary ringbuffer
 
   dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 4);
   dwords[offset++] = 'SWAP';
-  dwords[offset++] = kernel_memory()
-                         ->LookupHeap(*frontbuffer_ptr)
-                         ->GetPhysicalAddress(*frontbuffer_ptr);
+  dwords[offset++] = frontbuffer_address;
 
   dwords[offset++] = *width;
   dwords[offset++] = *height;

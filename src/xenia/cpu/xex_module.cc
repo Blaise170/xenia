@@ -103,10 +103,9 @@ bool XexModule::GetOptHeader(xex2_header_keys key, void** out_ptr) const {
   return XexModule::GetOptHeader(xex_header(), key, out_ptr);
 }
 
-const xex2_security_info* XexModule::GetSecurityInfo(
-    const xex2_header* header) {
-  return reinterpret_cast<const xex2_security_info*>(uintptr_t(header) +
-                                                     header->security_offset);
+const void* XexModule::GetSecurityInfo(const xex2_header* header) {
+  return reinterpret_cast<const void*>(uintptr_t(header) +
+                                       header->security_offset);
 }
 
 const PESection* XexModule::GetPESection(const char* name) {
@@ -779,7 +778,7 @@ int XexModule::ReadPEHeaders() {
   const uint8_t* p = memory()->TranslateVirtual(base_address_);
 
   // Verify DOS signature (MZ).
-  const IMAGE_DOS_HEADER* doshdr = (const IMAGE_DOS_HEADER*)p;
+  auto doshdr = reinterpret_cast<const IMAGE_DOS_HEADER*>(p);
   if (doshdr->e_magic != IMAGE_DOS_SIGNATURE) {
     XELOGE("PE signature mismatch; likely bad decryption/decompression");
     return 1;
@@ -789,7 +788,7 @@ int XexModule::ReadPEHeaders() {
   p += doshdr->e_lfanew;
 
   // Verify NT signature (PE\0\0).
-  const IMAGE_NT_HEADERS32* nthdr = (const IMAGE_NT_HEADERS32*)(p);
+  auto nthdr = reinterpret_cast<const IMAGE_NT_HEADERS32*>(p);
   if (nthdr->Signature != IMAGE_NT_SIGNATURE) {
     return 1;
   }
@@ -870,7 +869,11 @@ bool XexModule::Load(const std::string& name, const std::string& path,
                      const void* xex_addr, size_t xex_length) {
   auto src_header = reinterpret_cast<const xex2_header*>(xex_addr);
 
-  if (src_header->magic != 'XEX2') {
+  if (src_header->magic == 'XEX1') {
+    xex_format_ = kFormatXex1;
+  } else if (src_header->magic == 'XEX2') {
+    xex_format_ = kFormatXex2;
+  } else {
     return false;
   }
 
@@ -880,6 +883,34 @@ bool XexModule::Load(const std::string& name, const std::string& path,
   // Read in XEX headers
   xex_header_mem_.resize(src_header->header_size);
   std::memcpy(xex_header_mem_.data(), src_header, src_header->header_size);
+
+  if (xex_format_ == kFormatXex1) {
+    const xex1_security_info* xex1_sec_info =
+        reinterpret_cast<const xex1_security_info*>(
+            GetSecurityInfo(xex_header()));
+
+    security_info_.rsa_signature = xex1_sec_info->rsa_signature;
+    security_info_.aes_key = xex1_sec_info->aes_key;
+    security_info_.image_size = xex1_sec_info->image_size;
+    security_info_.image_flags = xex1_sec_info->image_flags;
+    security_info_.export_table = xex1_sec_info->export_table;
+    security_info_.load_address = xex1_sec_info->load_address;
+    security_info_.page_descriptor_count = xex1_sec_info->page_descriptor_count;
+    security_info_.page_descriptors = xex1_sec_info->page_descriptors;
+  } else if (xex_format_ == kFormatXex2) {
+    const xex2_security_info* xex2_sec_info =
+        reinterpret_cast<const xex2_security_info*>(
+            GetSecurityInfo(xex_header()));
+
+    security_info_.rsa_signature = xex2_sec_info->rsa_signature;
+    security_info_.aes_key = xex2_sec_info->aes_key;
+    security_info_.image_size = xex2_sec_info->image_size;
+    security_info_.image_flags = xex2_sec_info->image_flags;
+    security_info_.export_table = xex2_sec_info->export_table;
+    security_info_.load_address = xex2_sec_info->load_address;
+    security_info_.page_descriptor_count = xex2_sec_info->page_descriptor_count;
+    security_info_.page_descriptors = xex2_sec_info->page_descriptors;
+  }
 
   auto sec_header = xex_security_info();
 
@@ -1008,8 +1039,8 @@ bool XexModule::LoadContinue() {
   }
 
   // Load a specified module map and diff.
-  if (FLAGS_load_module_map.size()) {
-    if (!ReadMap(FLAGS_load_module_map.c_str())) {
+  if (cvars::load_module_map.size()) {
+    if (!ReadMap(cvars::load_module_map.c_str())) {
       return false;
     }
   }
@@ -1194,15 +1225,17 @@ bool XexModule::SetupLibraryImports(const char* name,
         //     bctr
         // Real consoles rewrite this with some code that sets r11.
         // If we did that we'd still have to put a thunk somewhere and do the
-        // dynamic lookup. Instead, we rewrite it to use syscalls, as they
-        // aren't used on the 360. CPU backends can either take the syscall
-        // or do something smarter.
-        //     sc
+        // dynamic lookup. Instead, we rewrite it to use syscalls.
+        // We use sc with a LEV operand of 2, which is reserved usage and
+        // should never see actual usage outside of our rewrite.
+        // CPU backends can either take the special form syscall or do
+        // something smarter.
+        //     sc 2
         //     blr
         //     nop
         //     nop
         uint8_t* p = memory()->TranslateVirtual(record_addr);
-        xe::store_and_swap<uint32_t>(p + 0x0, 0x44000002);
+        xe::store_and_swap<uint32_t>(p + 0x0, 0x44000042);
         xe::store_and_swap<uint32_t>(p + 0x4, 0x4E800020);
         xe::store_and_swap<uint32_t>(p + 0x8, 0x60000000);
         xe::store_and_swap<uint32_t>(p + 0xC, 0x60000000);

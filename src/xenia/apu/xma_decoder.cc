@@ -9,9 +9,8 @@
 
 #include "xenia/apu/xma_decoder.h"
 
-#include <gflags/gflags.h>
-
 #include "xenia/apu/xma_context.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
@@ -49,7 +48,8 @@ extern "C" {
 // do this, it's likely they are either passing the context to XAudio or
 // using the XMA* functions.
 
-DEFINE_bool(libav_verbose, false, "Verbose libav output (debug and above)");
+DEFINE_bool(libav_verbose, false, "Verbose libav output (debug and above)",
+            "APU");
 
 namespace xe {
 namespace apu {
@@ -60,7 +60,7 @@ XmaDecoder::XmaDecoder(cpu::Processor* processor)
 XmaDecoder::~XmaDecoder() = default;
 
 void av_log_callback(void* avcl, int level, const char* fmt, va_list va) {
-  if (!FLAGS_libav_verbose && level > AV_LOG_WARNING) {
+  if (!cvars::libav_verbose && level > AV_LOG_WARNING) {
     return;
   }
 
@@ -105,12 +105,15 @@ X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
       reinterpret_cast<cpu::MMIOWriteCallback>(MMIOWriteRegisterThunk));
 
   // Setup XMA context data.
+  // The Xbox 360 kernel allocates the contexts with X_PAGE_NOCACHE |
+  // X_PAGE_READWRITE and writes MmGetPhysicalAddress for the address to the
+  // register.
   context_data_first_ptr_ = memory()->SystemHeapAlloc(
       sizeof(XMA_CONTEXT_DATA) * kContextCount, 256, kSystemHeapPhysical);
   context_data_last_ptr_ =
       context_data_first_ptr_ + (sizeof(XMA_CONTEXT_DATA) * kContextCount - 1);
   register_file_[XE_XMA_REG_CONTEXT_ARRAY_ADDRESS].u32 =
-      context_data_first_ptr_;
+      memory()->GetPhysicalAddress(context_data_first_ptr_);
 
   // Setup XMA contexts.
   for (int i = 0; i < kContextCount; ++i) {
@@ -175,15 +178,20 @@ void XmaDecoder::WorkerThreadMain() {
 
 void XmaDecoder::Shutdown() {
   worker_running_ = false;
-  work_event_->Set();
+
+  if (work_event_) {
+    work_event_->Set();
+  }
 
   if (paused_) {
     Resume();
   }
 
-  // Wait for work thread.
-  xe::threading::Wait(worker_thread_->thread(), false);
-  worker_thread_.reset();
+  if (worker_thread_) {
+    // Wait for work thread.
+    xe::threading::Wait(worker_thread_->thread(), false);
+    worker_thread_.reset();
+  }
 
   if (context_data_first_ptr_) {
     memory()->SystemHeapFree(context_data_first_ptr_);

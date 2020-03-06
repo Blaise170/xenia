@@ -10,8 +10,6 @@
 #ifndef XENIA_KERNEL_UTIL_SHIM_UTILS_H_
 #define XENIA_KERNEL_UTIL_SHIM_UTILS_H_
 
-#include <gflags/gflags.h>
-
 #include <cstring>
 #include <string>
 
@@ -21,9 +19,8 @@
 #include "xenia/base/string_buffer.h"
 #include "xenia/cpu/export_resolver.h"
 #include "xenia/cpu/ppc/ppc_context.h"
+#include "xenia/kernel/kernel_flags.h"
 #include "xenia/kernel/kernel_state.h"
-
-DECLARE_bool(log_high_frequency_kernel_calls);
 
 namespace xe {
 namespace kernel {
@@ -36,8 +33,8 @@ using PPCContext = xe::cpu::ppc::PPCContext;
       library_name, ordinals::export_name,                     \
       (xe::cpu::xe_kernel_export_shim_fn)export_name##_shim);
 
-#define SHIM_MEM_BASE ppc_context->virtual_membase
-#define SHIM_MEM_ADDR(a) (a ? (ppc_context->virtual_membase + a) : nullptr)
+#define SHIM_MEM_ADDR(a) \
+  ((a) ? ppc_context->kernel_state->memory()->TranslateVirtual(a) : nullptr)
 
 #define SHIM_MEM_8(a) xe::load_and_swap<uint8_t>(SHIM_MEM_ADDR(a))
 #define SHIM_MEM_16(a) xe::load_and_swap<uint16_t>(SHIM_MEM_ADDR(a))
@@ -84,6 +81,45 @@ inline uint64_t get_arg_64(PPCContext* ppc_context, uint8_t index) {
   uint32_t stack_address = get_arg_stack_ptr(ppc_context, index - 8);
   return SHIM_MEM_64(stack_address);
 }
+
+inline std::string TranslateAnsiString(const Memory* memory,
+                                       const X_ANSI_STRING* ansi_string) {
+  if (!ansi_string || !ansi_string->length) {
+    return "";
+  }
+  return std::string(
+      memory->TranslateVirtual<const char*>(ansi_string->pointer),
+      ansi_string->length);
+}
+
+inline std::string TranslateAnsiStringAddress(const Memory* memory,
+                                              uint32_t guest_address) {
+  if (!guest_address) {
+    return "";
+  }
+  return TranslateAnsiString(
+      memory, memory->TranslateVirtual<const X_ANSI_STRING*>(guest_address));
+}
+
+inline std::wstring TranslateUnicodeString(
+    const Memory* memory, const X_UNICODE_STRING* unicode_string) {
+  if (!unicode_string) {
+    return L"";
+  }
+  uint16_t length = unicode_string->length;
+  if (!length) {
+    return L"";
+  }
+  const xe::be<uint16_t>* guest_string =
+      memory->TranslateVirtual<const xe::be<uint16_t>*>(
+          unicode_string->pointer);
+  std::wstring translated_string;
+  translated_string.reserve(length);
+  for (uint16_t i = 0; i < length; ++i) {
+    translated_string += wchar_t(uint16_t(guest_string[i]));
+  }
+  return translated_string;
+}
 }  // namespace util
 
 #define SHIM_GET_ARG_8(n) util::get_arg_8(ppc_context, n)
@@ -120,8 +156,9 @@ class Param {
     } else {
       uint32_t stack_ptr =
           uint32_t(init.ppc_context->r[1]) + 0x54 + (ordinal_ - 8) * 8;
-      *out_value =
-          xe::load_and_swap<V>(init.ppc_context->virtual_membase + stack_ptr);
+      *out_value = xe::load_and_swap<V>(
+          init.ppc_context->kernel_state->memory()->TranslateVirtual(
+              stack_ptr));
     }
   }
 
@@ -156,7 +193,10 @@ class ParamBase : public Param {
 class PointerParam : public ParamBase<uint32_t> {
  public:
   PointerParam(Init& init) : ParamBase(init) {
-    host_ptr_ = value_ ? init.ppc_context->virtual_membase + value_ : nullptr;
+    host_ptr_ =
+        value_
+            ? init.ppc_context->kernel_state->memory()->TranslateVirtual(value_)
+            : nullptr;
   }
   PointerParam(void* host_ptr) : ParamBase(), host_ptr_(host_ptr) {}
   PointerParam& operator=(void*& other) {
@@ -194,8 +234,8 @@ template <typename T>
 class PrimitivePointerParam : public ParamBase<uint32_t> {
  public:
   PrimitivePointerParam(Init& init) : ParamBase(init) {
-    host_ptr_ = value_ ? reinterpret_cast<xe::be<T>*>(
-                             init.ppc_context->virtual_membase + value_)
+    host_ptr_ = value_ ? init.ppc_context->kernel_state->memory()
+                             ->TranslateVirtual<xe::be<T>*>(value_)
                        : nullptr;
   }
   PrimitivePointerParam(T* host_ptr) : ParamBase() {
@@ -226,9 +266,11 @@ template <typename CHAR, typename STR>
 class StringPointerParam : public ParamBase<uint32_t> {
  public:
   StringPointerParam(Init& init) : ParamBase(init) {
-    host_ptr_ = value_ ? reinterpret_cast<CHAR*>(
-                             init.ppc_context->virtual_membase + value_)
-                       : nullptr;
+    host_ptr_ =
+        value_
+            ? init.ppc_context->kernel_state->memory()->TranslateVirtual<CHAR*>(
+                  value_)
+            : nullptr;
   }
   StringPointerParam(CHAR* host_ptr) : ParamBase(), host_ptr_(host_ptr) {}
   StringPointerParam& operator=(const CHAR*& other) {
@@ -252,9 +294,9 @@ class TypedPointerParam : public ParamBase<uint32_t> {
  public:
   TypedPointerParam(Init& init) : ParamBase(init) {
     host_ptr_ =
-        value_
-            ? reinterpret_cast<T*>(init.ppc_context->virtual_membase + value_)
-            : nullptr;
+        value_ ? init.ppc_context->kernel_state->memory()->TranslateVirtual<T*>(
+                     value_)
+               : nullptr;
   }
   TypedPointerParam(T* host_ptr) : ParamBase(), host_ptr_(host_ptr) {}
   TypedPointerParam& operator=(const T*& other) {
@@ -394,7 +436,7 @@ inline void AppendParam(StringBuffer* string_buffer,
     std::string name =
         name_string == nullptr
             ? "(null)"
-            : name_string->to_string(kernel_memory()->virtual_membase());
+            : util::TranslateAnsiString(kernel_memory(), name_string);
     string_buffer->AppendFormat("(%.8X,%s,%.8X)",
                                 uint32_t(record->root_directory), name.c_str(),
                                 uint32_t(record->attributes));
@@ -482,7 +524,7 @@ xe::cpu::Export* RegisterExport(R (*fn)(Ps&...), const char* name,
       auto params = std::make_tuple<Ps...>(Ps(init)...);
       if (export_entry->tags & xe::cpu::ExportTag::kLog &&
           (!(export_entry->tags & xe::cpu::ExportTag::kHighFrequency) ||
-           FLAGS_log_high_frequency_kernel_calls)) {
+           cvars::log_high_frequency_kernel_calls)) {
         PrintKernelCall(export_entry, params);
       }
       auto result =
@@ -516,7 +558,7 @@ xe::cpu::Export* RegisterExport(void (*fn)(Ps&...), const char* name,
       auto params = std::make_tuple<Ps...>(Ps(init)...);
       if (export_entry->tags & xe::cpu::ExportTag::kLog &&
           (!(export_entry->tags & xe::cpu::ExportTag::kHighFrequency) ||
-           FLAGS_log_high_frequency_kernel_calls)) {
+           cvars::log_high_frequency_kernel_calls)) {
         PrintKernelCall(export_entry, params);
       }
       KernelTrampoline(FN, std::forward<std::tuple<Ps...>>(params),

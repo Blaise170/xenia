@@ -2,14 +2,12 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2013 Ben Vanik. All rights reserved.                             *
+ * Copyright 2019 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
-
-#include <gflags/gflags.h>
 
 #include <vector>
 
@@ -27,18 +25,19 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xthread.h"
 
-DEFINE_string(cl, "", "Specify additional command-line provided to guest.");
+DEFINE_string(cl, "", "Specify additional command-line provided to guest.",
+              "Kernel");
 
-DEFINE_bool(kernel_debug_monitor, false, "Enable debug monitor.");
-DEFINE_bool(kernel_cert_monitor, false, "Enable cert monitor.");
-DEFINE_bool(kernel_pix, false, "Enable PIX.");
+DEFINE_bool(kernel_debug_monitor, false, "Enable debug monitor.", "Kernel");
+DEFINE_bool(kernel_cert_monitor, false, "Enable cert monitor.", "Kernel");
+DEFINE_bool(kernel_pix, false, "Enable PIX.", "Kernel");
 
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
 
 bool XboxkrnlModule::SendPIXCommand(const char* cmd) {
-  if (!FLAGS_kernel_pix) {
+  if (!cvars::kernel_pix) {
     return false;
   }
 
@@ -97,13 +96,14 @@ XboxkrnlModule::XboxkrnlModule(Emulator* emulator, KernelState* kernel_state)
   RegisterThreadingExports(export_resolver_, kernel_state_);
   RegisterUsbcamExports(export_resolver_, kernel_state_);
   RegisterVideoExports(export_resolver_, kernel_state_);
+  RegisterXConfigExports(export_resolver_, kernel_state_);
 
   // KeDebugMonitorData (?*)
   // Set to a valid value when a remote debugger is attached.
   // Offset 0x18 is a 4b pointer to a handler function that seems to take two
   // arguments. If we wanted to see what would happen we could fake that.
   uint32_t pKeDebugMonitorData;
-  if (!FLAGS_kernel_debug_monitor) {
+  if (!cvars::kernel_debug_monitor) {
     pKeDebugMonitorData = memory_->SystemHeapAlloc(4);
     auto lpKeDebugMonitorData = memory_->TranslateVirtual(pKeDebugMonitorData);
     xe::store_and_swap<uint32_t>(lpKeDebugMonitorData, 0);
@@ -125,7 +125,7 @@ XboxkrnlModule::XboxkrnlModule(Emulator* emulator, KernelState* kernel_state)
   // KeCertMonitorData (?*)
   // Always set to zero, ignored.
   uint32_t pKeCertMonitorData;
-  if (!FLAGS_kernel_cert_monitor) {
+  if (!cvars::kernel_cert_monitor) {
     pKeCertMonitorData = memory_->SystemHeapAlloc(4);
     auto lpKeCertMonitorData = memory_->TranslateVirtual(pKeCertMonitorData);
     xe::store_and_swap<uint32_t>(lpKeCertMonitorData, 0);
@@ -187,8 +187,8 @@ XboxkrnlModule::XboxkrnlModule(Emulator* emulator, KernelState* kernel_state)
   // Always set to "default.xex" (with quotes) for now.
   // TODO(gibbed): set this to the actual module name.
   std::string command_line("\"default.xex\"");
-  if (FLAGS_cl.length()) {
-    command_line += " " + FLAGS_cl;
+  if (cvars::cl.length()) {
+    command_line += " " + cvars::cl;
   }
   uint32_t command_line_length =
       xe::align(static_cast<uint32_t>(command_line.length()) + 1, 1024u);

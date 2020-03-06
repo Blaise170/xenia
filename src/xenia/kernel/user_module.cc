@@ -20,7 +20,7 @@
 #include "xenia/kernel/xfile.h"
 #include "xenia/kernel/xthread.h"
 
-DEFINE_bool(xex_apply_patches, true, "Apply XEX patches.");
+DEFINE_bool(xex_apply_patches, true, "Apply XEX patches.", "Kernel");
 
 namespace xe {
 namespace kernel {
@@ -102,7 +102,7 @@ X_STATUS UserModule::LoadFromFile(std::string path) {
     return result;
   }
 
-  if (FLAGS_xex_apply_patches) {
+  if (cvars::xex_apply_patches) {
     // Search for xexp patch file
     auto patch_entry = kernel_state()->file_system()->ResolvePath(path_ + "p");
 
@@ -135,7 +135,7 @@ X_STATUS UserModule::LoadFromMemory(const void* addr, const size_t length) {
   auto processor = kernel_state()->processor();
 
   auto magic = xe::load_and_swap<uint32_t>(addr);
-  if (magic == 'XEX2') {
+  if (magic == 'XEX2' || magic == 'XEX1') {
     module_format_ = kModuleFormatXex;
   } else if (magic == 0x7F454C46 /* 0x7F 'ELF' */) {
     module_format_ = kModuleFormatElf;
@@ -314,11 +314,11 @@ X_STATUS UserModule::GetOptHeader(xex2_header_keys key,
   if (!header) {
     return X_STATUS_UNSUCCESSFUL;
   }
-  return GetOptHeader(memory()->virtual_membase(), header, key,
-                      out_header_guest_ptr);
+  return GetOptHeader(memory(), header, key, out_header_guest_ptr);
 }
 
-X_STATUS UserModule::GetOptHeader(uint8_t* membase, const xex2_header* header,
+X_STATUS UserModule::GetOptHeader(const Memory* memory,
+                                  const xex2_header* header,
                                   xex2_header_keys key,
                                   uint32_t* out_header_guest_ptr) {
   assert_not_null(out_header_guest_ptr);
@@ -337,14 +337,11 @@ X_STATUS UserModule::GetOptHeader(uint8_t* membase, const xex2_header* header,
         break;
       case 0x01:
         // Return pointer to data stored in header value.
-        field_value = static_cast<uint32_t>(
-            reinterpret_cast<const uint8_t*>(&opt_header.value) - membase);
+        field_value = memory->HostToGuestVirtual(&opt_header.value);
         break;
       default:
         // Data stored at offset to header.
-        field_value = static_cast<uint32_t>(
-                          reinterpret_cast<const uint8_t*>(header) - membase) +
-                      opt_header.offset;
+        field_value = memory->HostToGuestVirtual(header) + opt_header.offset;
         break;
     }
     break;

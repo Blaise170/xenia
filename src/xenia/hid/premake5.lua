@@ -11,9 +11,6 @@ project("xenia-hid")
   })
   defines({
   })
-  includedirs({
-    project_root.."/third_party/gflags/src",
-  })
   local_platform_files()
   removefiles({"*_demo.cc"})
 
@@ -23,22 +20,14 @@ project("xenia-hid-demo")
   kind("WindowedApp")
   language("C++")
   links({
-    "gflags",
-    "glew",
     "imgui",
     "volk",
     "xenia-base",
     "xenia-hid",
     "xenia-hid-nop",
+    "xenia-hid-sdl",
     "xenia-ui",
     "xenia-ui-vulkan",
-  })
-  defines({
-    "GLEW_STATIC=1",
-    "GLEW_MX=1",
-  })
-  includedirs({
-    project_root.."/third_party/gflags/src",
   })
   files({
     "hid_demo.cc",
@@ -53,8 +42,8 @@ project("xenia-hid-demo")
       "X11",
       "xcb",
       "X11-xcb",
-      "GL",
       "vulkan",
+      "SDL2",
     })
 
   filter("platforms:Windows")

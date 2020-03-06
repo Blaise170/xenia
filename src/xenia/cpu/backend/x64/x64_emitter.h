@@ -2,7 +2,7 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2013 Ben Vanik. All rights reserved.                             *
+ * Copyright 2019 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
@@ -38,6 +38,8 @@ namespace x64 {
 
 class X64Backend;
 class X64CodeCache;
+
+struct EmitFunctionInfo;
 
 enum RegisterFlags {
   REG_DEST = (1 << 0),
@@ -85,7 +87,13 @@ enum XmmConst {
   XMMPackUINT_2101010_MaskPacked,
   XMMPackUINT_2101010_Shift,
   XMMUnpackUINT_2101010_Overflow,
-  XMMUnpackOverflowNaN,
+  XMMPackULONG_4202020_MinUnpacked,
+  XMMPackULONG_4202020_MaxUnpacked,
+  XMMPackULONG_4202020_MaskUnpacked,
+  XMMPackULONG_4202020_PermuteXZ,
+  XMMPackULONG_4202020_PermuteYW,
+  XMMUnpackULONG_4202020_Permute,
+  XMMUnpackULONG_4202020_Overflow,
   XMMOneOver255,
   XMMMaskEvenPI16,
   XMMShiftMaskEvenPI16,
@@ -105,6 +113,7 @@ enum XmmConst {
   XMMIntMax,
   XMMIntMaxPD,
   XMMPosIntMinPS,
+  XMMQNaN,
 };
 
 // Unfortunately due to the design of xbyak we have to pass this to the ctor.
@@ -196,8 +205,6 @@ class X64Emitter : public Xbyak::CodeGenerator {
 
   void nop(size_t length = 1);
 
-  // TODO(benvanik): Label for epilog (don't use strings).
-
   // Moves a 64bit immediate into memory.
   bool ConstantFitsIn32Reg(uint64_t v);
   void MovMem64(const Xbyak::RegExp& addr, uint64_t v);
@@ -207,6 +214,9 @@ class X64Emitter : public Xbyak::CodeGenerator {
   void LoadConstantXmm(Xbyak::Xmm dest, double v);
   void LoadConstantXmm(Xbyak::Xmm dest, const vec128_t& v);
   Xbyak::Address StashXmm(int index, const Xbyak::Xmm& r);
+  Xbyak::Address StashConstantXmm(int index, float v);
+  Xbyak::Address StashConstantXmm(int index, double v);
+  Xbyak::Address StashConstantXmm(int index, const vec128_t& v);
 
   bool IsFeatureEnabled(uint32_t feature_flag) const {
     return (feature_flags_ & feature_flag) != 0;
@@ -217,8 +227,9 @@ class X64Emitter : public Xbyak::CodeGenerator {
   size_t stack_size() const { return stack_size_; }
 
  protected:
-  void* Emplace(size_t stack_size, GuestFunction* function = nullptr);
-  bool Emit(hir::HIRBuilder* builder, size_t* out_stack_size);
+  void* Emplace(const EmitFunctionInfo& func_info,
+                GuestFunction* function = nullptr);
+  bool Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info);
   void EmitGetCurrentThreadId();
   void EmitTraceUserCallReturn();
 

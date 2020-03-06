@@ -20,7 +20,6 @@
 #include "xenia/base/ring_buffer.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/graphics_system.h"
-#include "xenia/gpu/registers.h"
 #include "xenia/gpu/sampler_info.h"
 #include "xenia/gpu/texture_info.h"
 #include "xenia/gpu/xenos.h"
@@ -120,6 +119,8 @@ void CommandProcessor::EndTracing() {
     return;
   }
   assert_true(trace_state_ == TraceState::kStreaming);
+  FinalizeTrace();
+  trace_state_ = TraceState::kDisabled;
   trace_writer_.Close();
 }
 
@@ -351,20 +352,20 @@ void CommandProcessor::MakeCoherent() {
   // https://cgit.freedesktop.org/xorg/driver/xf86-video-radeonhd/tree/src/r6xx_accel.c?id=3f8b6eccd9dba116cc4801e7f80ce21a879c67d2#n454
 
   RegisterFile* regs = register_file_;
-  auto status_host = regs->values[XE_GPU_REG_COHER_STATUS_HOST].u32;
+  auto& status_host = regs->Get<reg::COHER_STATUS_HOST>();
   auto base_host = regs->values[XE_GPU_REG_COHER_BASE_HOST].u32;
   auto size_host = regs->values[XE_GPU_REG_COHER_SIZE_HOST].u32;
 
-  if (!(status_host & 0x80000000ul)) {
+  if (!status_host.status) {
     return;
   }
 
   const char* action = "N/A";
-  if ((status_host & 0x03000000) == 0x03000000) {
+  if (status_host.vc_action_ena && status_host.tc_action_ena) {
     action = "VC | TC";
-  } else if (status_host & 0x02000000) {
+  } else if (status_host.tc_action_ena) {
     action = "TC";
-  } else if (status_host & 0x01000000) {
+  } else if (status_host.vc_action_ena) {
     action = "VC";
   }
 
@@ -373,8 +374,7 @@ void CommandProcessor::MakeCoherent() {
          base_host + size_host, size_host, action);
 
   // Mark coherent.
-  status_host &= ~0x80000000ul;
-  regs->values[XE_GPU_REG_COHER_STATUS_HOST].u32 = status_host;
+  status_host.status = 0;
 }
 
 void CommandProcessor::PrepareForWait() { trace_writer_.Flush(); }
@@ -393,7 +393,7 @@ void CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   // This prevents the display from pulling the backbuffer out from under us.
   // If we skip a lot then we may need to buffer more, but as the display
   // thread should be fairly idle that shouldn't happen.
-  if (!FLAGS_vsync) {
+  if (!cvars::vsync) {
     std::lock_guard<std::mutex> lock(swap_state_.mutex);
     if (swap_state_.pending) {
       swap_state_.pending = false;
@@ -439,6 +439,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index,
     auto file_name = xe::format_string(L"%8X_stream.xtr", title_id);
     auto path = trace_stream_path_ + file_name;
     trace_writer_.Open(path, title_id);
+    InitializeTrace();
   }
 
   // Adjust pointer base.
@@ -462,6 +463,8 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index,
       break;
     }
   } while (reader.read_count());
+
+  OnPrimaryBufferEnd();
 
   trace_writer_.WritePrimaryBufferEnd();
 
@@ -740,6 +743,7 @@ bool CommandProcessor::ExecutePacketType3(RingBuffer* reader, uint32_t packet) {
       trace_writer_.WriteEvent(EventCommand::Type::kSwap);
       trace_writer_.Flush();
       if (trace_state_ == TraceState::kSingleFrame) {
+        FinalizeTrace();
         trace_state_ = TraceState::kDisabled;
         trace_writer_.Close();
       }
@@ -749,6 +753,7 @@ bool CommandProcessor::ExecutePacketType3(RingBuffer* reader, uint32_t packet) {
       auto file_name = xe::format_string(L"%8X_%u.xtr", title_id, counter_ - 1);
       auto path = trace_frame_path_ + file_name;
       trace_writer_.Open(path, title_id);
+      InitializeTrace();
     }
   }
 
@@ -895,7 +900,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(RingBuffer* reader,
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
-        if (!FLAGS_vsync) {
+        if (!cvars::vsync) {
           // User wants it fast and dangerous.
           xe::threading::MaybeYield();
         } else {
@@ -1148,44 +1153,51 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX(RingBuffer* reader,
   // ID = dword0 & 0x3F;
   // use = dword0 & 0x40;
   uint32_t dword0 = reader->ReadAndSwap<uint32_t>();  // viz query info
-  uint32_t dword1 = reader->ReadAndSwap<uint32_t>();
-  uint32_t index_count = dword1 >> 16;
-  auto prim_type = static_cast<PrimitiveType>(dword1 & 0x3F);
+  reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
+  vgt_draw_initiator.value = reader->ReadAndSwap<uint32_t>();
+  WriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, vgt_draw_initiator.value);
+
   bool is_indexed = false;
   IndexBufferInfo index_buffer_info;
-  uint32_t src_sel = (dword1 >> 6) & 0x3;
-  if (src_sel == 0x0) {
-    // DI_SRC_SEL_DMA
-    // Indexed draw.
-    is_indexed = true;
-    index_buffer_info.guest_base = reader->ReadAndSwap<uint32_t>();
-    uint32_t index_size = reader->ReadAndSwap<uint32_t>();
-    index_buffer_info.endianness = static_cast<Endian>(index_size >> 30);
-    index_size &= 0x00FFFFFF;
-    bool index_32bit = (dword1 >> 11) & 0x1;
-    index_buffer_info.format =
-        index_32bit ? IndexFormat::kInt32 : IndexFormat::kInt16;
-    index_size *= index_32bit ? 4 : 2;
-    index_buffer_info.length = index_size;
-    index_buffer_info.count = index_count;
-  } else if (src_sel == 0x1) {
-    // DI_SRC_SEL_IMMEDIATE
-    assert_always();
-  } else if (src_sel == 0x2) {
-    // DI_SRC_SEL_AUTO_INDEX
-    // Auto draw.
-    index_buffer_info.guest_base = 0;
-    index_buffer_info.length = 0;
-  } else {
-    // Invalid source select.
-    assert_always();
+  switch (vgt_draw_initiator.source_select) {
+    case xenos::SourceSelect::kDMA: {
+      // Indexed draw.
+      is_indexed = true;
+      index_buffer_info.guest_base = reader->ReadAndSwap<uint32_t>();
+      uint32_t index_size = reader->ReadAndSwap<uint32_t>();
+      index_buffer_info.endianness = static_cast<Endian>(index_size >> 30);
+      index_size &= 0x00FFFFFF;
+      index_buffer_info.format = vgt_draw_initiator.index_size;
+      index_size *=
+          (vgt_draw_initiator.index_size == IndexFormat::kInt32) ? 4 : 2;
+      index_buffer_info.length = index_size;
+      index_buffer_info.count = vgt_draw_initiator.num_indices;
+    } break;
+    case xenos::SourceSelect::kImmediate: {
+      // TODO(Triang3l): VGT_IMMED_DATA.
+      assert_always();
+    } break;
+    case xenos::SourceSelect::kAutoIndex: {
+      // Auto draw.
+      index_buffer_info.guest_base = 0;
+      index_buffer_info.length = 0;
+    } break;
+    default: {
+      // Invalid source select.
+      assert_always();
+    } break;
   }
 
-  bool success = IssueDraw(prim_type, index_count,
-                           is_indexed ? &index_buffer_info : nullptr);
+  bool success =
+      IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+                is_indexed ? &index_buffer_info : nullptr,
+                xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode,
+                                           vgt_draw_initiator.prim_type));
   if (!success) {
-    XELOGE("PM4_DRAW_INDX(%d, %d, %d): Failed in backend", index_count,
-           prim_type, src_sel);
+    XELOGE("PM4_DRAW_INDX(%d, %d, %d): Failed in backend",
+           vgt_draw_initiator.num_indices,
+           uint32_t(vgt_draw_initiator.prim_type),
+           uint32_t(vgt_draw_initiator.source_select));
   }
 
   return true;
@@ -1195,21 +1207,27 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(RingBuffer* reader,
                                                       uint32_t packet,
                                                       uint32_t count) {
   // draw using supplied indices in packet
-  uint32_t dword0 = reader->ReadAndSwap<uint32_t>();
-  uint32_t index_count = dword0 >> 16;
-  auto prim_type = static_cast<PrimitiveType>(dword0 & 0x3F);
-  uint32_t src_sel = (dword0 >> 6) & 0x3;
-  assert_true(src_sel == 0x2);  // 'SrcSel=AutoIndex'
+  reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
+  vgt_draw_initiator.value = reader->ReadAndSwap<uint32_t>();
+  WriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, vgt_draw_initiator.value);
+  assert_true(vgt_draw_initiator.source_select ==
+              xenos::SourceSelect::kAutoIndex);
   // Index buffer unused as automatic.
-  // bool index_32bit = (dword0 >> 11) & 0x1;
-  // uint32_t indices_size = index_count * (index_32bit ? 4 : 2);
+  // uint32_t indices_size =
+  //     vgt_draw_initiator.num_indices *
+  //         (vgt_draw_initiator.index_size == IndexFormat::kInt32 ? 4 : 2);
   // uint32_t index_ptr = reader->ptr();
+  // TODO(Triang3l): VGT_IMMED_DATA.
   reader->AdvanceRead((count - 1) * sizeof(uint32_t));
 
-  bool success = IssueDraw(prim_type, index_count, nullptr);
+  bool success = IssueDraw(
+      vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices, nullptr,
+      xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode,
+                                 vgt_draw_initiator.prim_type));
   if (!success) {
-    XELOGE("PM4_DRAW_INDX_IMM(%d, %d): Failed in backend", index_count,
-           prim_type);
+    XELOGE("PM4_DRAW_INDX_IMM(%d, %d): Failed in backend",
+           vgt_draw_initiator.num_indices,
+           uint32_t(vgt_draw_initiator.prim_type));
   }
 
   return true;

@@ -400,7 +400,7 @@ std::pair<VkDeviceSize, VkDeviceSize> BufferCache::UploadConstantRegisters(
     }
   }
   for (int i = 0; i < 32; ++i) {
-    if (constant_register_map.int_bitmap & (1 << i)) {
+    if (constant_register_map.loop_bitmap & (1 << i)) {
       xe::store<uint32_t>(dest_ptr,
                           values[XE_GPU_REG_SHADER_CONSTANT_LOOP_00 + i].u32);
       dest_ptr += 4;
@@ -639,9 +639,24 @@ VkDescriptorSet BufferCache::PrepareVertexSet(
         break;
     }
 
-    if (fetch->type != 0x3) {
-      // TODO(DrChat): Some games use type 0x0 (with no data).
-      return nullptr;
+    // TODO(DrChat): Some games use type kInvalidTexture (with no data).
+    switch (fetch->type) {
+      case xenos::FetchConstantType::kVertex:
+        break;
+      case xenos::FetchConstantType::kInvalidVertex:
+        if (cvars::gpu_allow_invalid_fetch_constants) {
+          break;
+        }
+        XELOGW(
+            "Vertex fetch constant %u (%.8X %.8X) has \"invalid\" type! This "
+            "is incorrect behavior, but you can try bypassing this by "
+            "launching Xenia with --gpu_allow_invalid_fetch_constants=true.",
+            vertex_binding.fetch_constant, fetch->dword_0, fetch->dword_1);
+        return nullptr;
+      default:
+        XELOGW("Vertex fetch constant %u (%.8X %.8X) is completely invalid!",
+               vertex_binding.fetch_constant, fetch->dword_0, fetch->dword_1);
+        return nullptr;
     }
 
     // TODO(benvanik): compute based on indices or vertex count.
@@ -654,9 +669,8 @@ VkDescriptorSet BufferCache::PrepareVertexSet(
     // trace_writer_.WriteMemoryRead(physical_address, source_length);
 
     // Upload (or get a cached copy of) the buffer.
-    auto buffer_ref =
-        UploadVertexBuffer(command_buffer, physical_address, source_length,
-                           static_cast<Endian>(fetch->endian), fence);
+    auto buffer_ref = UploadVertexBuffer(command_buffer, physical_address,
+                                         source_length, fetch->endian, fence);
     if (buffer_ref.second == VK_WHOLE_SIZE) {
       // Failed to upload buffer.
       XELOGW("Failed to upload vertex buffer!");

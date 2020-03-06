@@ -96,10 +96,17 @@ dword_result_t NtAllocateVirtualMemory(lpdword_t base_addr_ptr,
     XELOGW("Game setting EXECUTE bit on allocation");
   }
 
-  // Adjust size.
-  uint32_t page_size = 4096;
-  if (alloc_type & X_MEM_LARGE_PAGES) {
-    page_size = 64 * 1024;
+  uint32_t page_size;
+  if (*base_addr_ptr != 0) {
+    // ignore specified page size when base address is specified.
+    auto heap = kernel_memory()->LookupHeap(*base_addr_ptr);
+    page_size = heap->page_size();
+  } else {
+    // Adjust size.
+    page_size = 4 * 1024;
+    if (alloc_type & X_MEM_LARGE_PAGES) {
+      page_size = 64 * 1024;
+    }
   }
 
   // Round the base address down to the nearest page boundary.
@@ -330,9 +337,20 @@ dword_result_t MmAllocatePhysicalMemoryEx(dword_t flags, dword_t region_size,
   uint32_t allocation_type = kMemoryAllocationReserve | kMemoryAllocationCommit;
   uint32_t protect = FromXdkProtectFlags(protect_bits);
   bool top_down = true;
-  auto heap = kernel_memory()->LookupHeapByType(true, page_size);
+  auto heap = static_cast<PhysicalHeap*>(
+      kernel_memory()->LookupHeapByType(true, page_size));
+  // min_addr_range/max_addr_range are bounds in physical memory, not virtual.
+  uint32_t heap_base = heap->heap_base();
+  uint32_t heap_physical_address_offset = heap->GetPhysicalAddress(heap_base);
+  uint32_t heap_min_addr =
+      xe::sat_sub(min_addr_range.value(), heap_physical_address_offset);
+  uint32_t heap_max_addr =
+      xe::sat_sub(max_addr_range.value(), heap_physical_address_offset);
+  uint32_t heap_size = heap->heap_size();
+  heap_min_addr = heap_base + std::min(heap_min_addr, heap_size - 1);
+  heap_max_addr = heap_base + std::min(heap_max_addr, heap_size - 1);
   uint32_t base_address;
-  if (!heap->AllocRange(min_addr_range, max_addr_range, adjusted_size,
+  if (!heap->AllocRange(heap_min_addr, heap_max_addr, adjusted_size,
                         adjusted_alignment, allocation_type, protect, top_down,
                         &base_address)) {
     // Failed - assume no memory available.
@@ -502,13 +520,11 @@ dword_result_t MmGetPhysicalAddress(dword_t base_address) {
   //   _In_  PVOID BaseAddress
   // );
   // base_address = result of MmAllocatePhysicalMemory.
-  assert_true(base_address >= 0xA0000000);
-
-  uint32_t physical_address = base_address & 0x1FFFFFFF;
-  if (base_address >= 0xE0000000) {
-    physical_address += 0x1000;
+  uint32_t physical_address = kernel_memory()->GetPhysicalAddress(base_address);
+  assert_true(physical_address != UINT32_MAX);
+  if (physical_address == UINT32_MAX) {
+    physical_address = 0;
   }
-
   return physical_address;
 }
 DECLARE_XBOXKRNL_EXPORT1(MmGetPhysicalAddress, kMemory, kImplemented);
@@ -542,6 +558,12 @@ dword_result_t ExAllocatePoolTypeWithTag(dword_t size, dword_t tag,
   return addr;
 }
 DECLARE_XBOXKRNL_EXPORT1(ExAllocatePoolTypeWithTag, kMemory, kImplemented);
+
+dword_result_t ExAllocatePool(dword_t size) {
+  const uint32_t none = 0x656E6F4E;  // 'None'
+  return ExAllocatePoolTypeWithTag(size, none, 0);
+}
+DECLARE_XBOXKRNL_EXPORT1(ExAllocatePool, kMemory, kImplemented);
 
 void ExFreePool(lpvoid_t base_address) {
   kernel_state()->memory()->SystemHeapFree(base_address);

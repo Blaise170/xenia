@@ -48,6 +48,11 @@ void VulkanCommandProcessor::RequestFrameTrace(const std::wstring& root_path) {
   return CommandProcessor::RequestFrameTrace(root_path);
 }
 
+void VulkanCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr,
+                                                      uint32_t length) {}
+
+void VulkanCommandProcessor::RestoreEDRAMSnapshot(const void* snapshot) {}
+
 void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
   cache_clear_requested_ = true;
@@ -356,7 +361,7 @@ void VulkanCommandProcessor::BeginFrame() {
   // The capture will end when these commands are submitted to the queue.
   static uint32_t frame = 0;
   if (device_->is_renderdoc_attached() && !capturing_ &&
-      (FLAGS_vulkan_renderdoc_capture_all || trace_requested_)) {
+      (cvars::vulkan_renderdoc_capture_all || trace_requested_)) {
     if (queue_mutex_) {
       queue_mutex_->lock();
     }
@@ -593,7 +598,8 @@ Shader* VulkanCommandProcessor::LoadShader(ShaderType shader_type,
 
 bool VulkanCommandProcessor::IssueDraw(PrimitiveType primitive_type,
                                        uint32_t index_count,
-                                       IndexBufferInfo* index_buffer_info) {
+                                       IndexBufferInfo* index_buffer_info,
+                                       bool major_mode_explicit) {
   auto& regs = *register_file_;
 
 #if FINE_GRAINED_DRAW_SCOPES
@@ -961,8 +967,8 @@ bool VulkanCommandProcessor::IssueCopy() {
       fetch = &group->vertex_fetch_2;
       break;
   }
-  assert_true(fetch->type == 3);
-  assert_true(fetch->endian == 2);
+  assert_true(fetch->type == xenos::FetchConstantType::kVertex);
+  assert_true(fetch->endian == Endian::k8in32);
   assert_true(fetch->size == 6);
   const uint8_t* vertex_addr = memory_->TranslatePhysical(fetch->address << 2);
   trace_writer_.WriteMemoryRead(fetch->address << 2, fetch->size * 4);
@@ -974,7 +980,7 @@ bool VulkanCommandProcessor::IssueCopy() {
   float dest_points[6];
   for (int i = 0; i < 6; i++) {
     dest_points[i] =
-        GpuSwap(xe::load<float>(vertex_addr + i * 4), Endian(fetch->endian)) +
+        GpuSwap(xe::load<float>(vertex_addr + i * 4), fetch->endian) +
         vtx_offset;
   }
 
@@ -1000,10 +1006,10 @@ bool VulkanCommandProcessor::IssueCopy() {
   if (is_color_source) {
     // Source from a color target.
     reg::RB_COLOR_INFO color_info[4] = {
-        regs[XE_GPU_REG_RB_COLOR_INFO].u32,
-        regs[XE_GPU_REG_RB_COLOR1_INFO].u32,
-        regs[XE_GPU_REG_RB_COLOR2_INFO].u32,
-        regs[XE_GPU_REG_RB_COLOR3_INFO].u32,
+        regs.Get<reg::RB_COLOR_INFO>(),
+        regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR1_INFO),
+        regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR2_INFO),
+        regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR3_INFO),
     };
     color_edram_base = color_info[copy_src_select].color_base;
     color_format = color_info[copy_src_select].color_format;
@@ -1023,7 +1029,7 @@ bool VulkanCommandProcessor::IssueCopy() {
   Endian resolve_endian = Endian::k8in32;
   if (copy_regs->copy_dest_info.copy_dest_endian <= Endian128::k16in32) {
     resolve_endian =
-        static_cast<Endian>(copy_regs->copy_dest_info.copy_dest_endian.value());
+        static_cast<Endian>(copy_regs->copy_dest_info.copy_dest_endian);
   }
 
   // Demand a resolve texture from the texture cache.
@@ -1289,7 +1295,7 @@ bool VulkanCommandProcessor::IssueCopy() {
   // Perform any requested clears.
   uint32_t copy_depth_clear = regs[XE_GPU_REG_RB_DEPTH_CLEAR].u32;
   uint32_t copy_color_clear = regs[XE_GPU_REG_RB_COLOR_CLEAR].u32;
-  uint32_t copy_color_clear_low = regs[XE_GPU_REG_RB_COLOR_CLEAR_LOW].u32;
+  uint32_t copy_color_clear_low = regs[XE_GPU_REG_RB_COLOR_CLEAR_LO].u32;
   assert_true(copy_color_clear == copy_color_clear_low);
 
   if (color_clear_enabled) {
@@ -1321,6 +1327,10 @@ bool VulkanCommandProcessor::IssueCopy() {
 
   return true;
 }
+
+void VulkanCommandProcessor::InitializeTrace() {}
+
+void VulkanCommandProcessor::FinalizeTrace() {}
 
 }  // namespace vulkan
 }  // namespace gpu

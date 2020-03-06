@@ -2,7 +2,7 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2015 Ben Vanik. All rights reserved.                             *
+ * Copyright 2020 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
@@ -14,6 +14,7 @@
 
 #include "third_party/imgui/imgui.h"
 #include "xenia/base/clock.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/debugging.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
@@ -25,6 +26,8 @@
 #include "xenia/ui/file_picker.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
+
+DECLARE_bool(debug);
 
 namespace xe {
 namespace app {
@@ -151,7 +154,13 @@ bool EmulatorWindow::Initialize() {
         ShowHelpWebsite();
       } break;
 
-      default: { handled = false; } break;
+      case 0x71: {  // VK_F2
+        ShowCommitID();
+      } break;
+
+      default: {
+        handled = false;
+      } break;
     }
     e->set_handled(handled);
   });
@@ -255,12 +264,8 @@ bool EmulatorWindow::Initialize() {
   auto help_menu = MenuItem::Create(MenuItem::Type::kPopup, L"&Help");
   {
     help_menu->AddChild(MenuItem::Create(
-        MenuItem::Type::kString, L"Build commit on GitHub...", [this]() {
-          std::wstring url =
-              std::wstring(L"https://github.com/xenia-project/xenia/tree/") +
-              xe::to_wstring(XE_BUILD_COMMIT) + L"/";
-          LaunchBrowser(url.c_str());
-        }));
+        MenuItem::Type::kString, L"Build commit on GitHub...", L"F2",
+        std::bind(&EmulatorWindow::ShowCommitID, this)));
     help_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, L"Recent changes on GitHub...", [this]() {
           std::wstring url =
@@ -288,9 +293,8 @@ bool EmulatorWindow::Initialize() {
   return true;
 }
 
-void EmulatorWindow::FileDrop(wchar_t* filename) {
-  std::wstring path = filename;
-  auto result = emulator_->LaunchPath(path);
+void EmulatorWindow::FileDrop(const wchar_t* filename) {
+  auto result = emulator_->LaunchPath(filename);
   if (XFAILED(result)) {
     // TODO: Display a message box.
     XELOGE("Failed to launch target: %.8X", result);
@@ -385,7 +389,7 @@ void EmulatorWindow::CpuTimeScalarSetDouble() {
 }
 
 void EmulatorWindow::CpuBreakIntoDebugger() {
-  if (!FLAGS_debug) {
+  if (!cvars::debug) {
     xe::ui::ImGuiDialog::ShowMessageBox(window_.get(), "Xenia Debugger",
                                         "Xenia must be launched with the "
                                         "--debug flag in order to enable "
@@ -423,6 +427,13 @@ void EmulatorWindow::ToggleFullscreen() {
 }
 
 void EmulatorWindow::ShowHelpWebsite() { LaunchBrowser(L"https://xenia.jp"); }
+
+void EmulatorWindow::ShowCommitID() {
+  std::wstring url =
+      std::wstring(L"https://github.com/xenia-project/xenia/commit/") +
+      xe::to_wstring(XE_BUILD_COMMIT) + L"/";
+  LaunchBrowser(url.c_str());
+}
 
 void EmulatorWindow::UpdateTitle() {
   std::wstring title(base_title_);

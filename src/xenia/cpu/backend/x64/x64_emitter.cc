@@ -2,14 +2,12 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2013 Ben Vanik. All rights reserved.                             *
+ * Copyright 2019 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
 
 #include "xenia/cpu/backend/x64/x64_emitter.h"
-
-#include <gflags/gflags.h>
 
 #include <stddef.h>
 #include <climits>
@@ -35,12 +33,13 @@
 #include "xenia/cpu/symbol.h"
 #include "xenia/cpu/thread_state.h"
 
-DEFINE_bool(enable_debugprint_log, false,
-            "Log debugprint traps to the active debugger");
+DEFINE_bool(debugprint_trap_log, false,
+            "Log debugprint traps to the active debugger", "CPU");
 DEFINE_bool(ignore_undefined_externs, true,
-            "Don't exit when an undefined extern is called.");
+            "Don't exit when an undefined extern is called.", "CPU");
 DEFINE_bool(emit_source_annotations, false,
-            "Add extra movs and nops to make disassembly easier to read.");
+            "Add extra movs and nops to make disassembly easier to read.",
+            "CPU");
 
 namespace xe {
 namespace cpu {
@@ -71,7 +70,7 @@ X64Emitter::X64Emitter(X64Backend* backend, XbyakAllocator* allocator)
       backend_(backend),
       code_cache_(backend->code_cache()),
       allocator_(allocator) {
-  if (FLAGS_enable_haswell_instructions) {
+  if (cvars::use_haswell_instructions) {
     feature_flags_ |= cpu_.has(Xbyak::util::Cpu::tAVX2) ? kX64EmitAVX2 : 0;
     feature_flags_ |= cpu_.has(Xbyak::util::Cpu::tFMA) ? kX64EmitFMA : 0;
     feature_flags_ |= cpu_.has(Xbyak::util::Cpu::tLZCNT) ? kX64EmitLZCNT : 0;
@@ -103,14 +102,14 @@ bool X64Emitter::Emit(GuestFunction* function, HIRBuilder* builder,
   source_map_arena_.Reset();
 
   // Fill the generator with code.
-  size_t stack_size = 0;
-  if (!Emit(builder, &stack_size)) {
+  EmitFunctionInfo func_info = {};
+  if (!Emit(builder, func_info)) {
     return false;
   }
 
   // Copy the final code to the cache and relocate it.
   *out_code_size = getSize();
-  *out_code_address = Emplace(stack_size, function);
+  *out_code_address = Emplace(func_info, function);
 
   // Stash source map.
   source_map_arena_.CloneContents(out_source_map);
@@ -118,18 +117,20 @@ bool X64Emitter::Emit(GuestFunction* function, HIRBuilder* builder,
   return true;
 }
 
-void* X64Emitter::Emplace(size_t stack_size, GuestFunction* function) {
+void* X64Emitter::Emplace(const EmitFunctionInfo& func_info,
+                          GuestFunction* function) {
   // To avoid changing xbyak, we do a switcharoo here.
   // top_ points to the Xbyak buffer, and since we are in AutoGrow mode
   // it has pending relocations. We copy the top_ to our buffer, swap the
   // pointer, relocate, then return the original scratch pointer for use.
   uint8_t* old_address = top_;
   void* new_address;
+  assert_true(func_info.code_size.total == size_);
   if (function) {
-    new_address = code_cache_->PlaceGuestCode(function->address(), top_, size_,
-                                              stack_size, function);
+    new_address = code_cache_->PlaceGuestCode(function->address(), top_,
+                                              func_info, function);
   } else {
-    new_address = code_cache_->PlaceHostCode(0, top_, size_, stack_size);
+    new_address = code_cache_->PlaceHostCode(0, top_, func_info);
   }
   top_ = reinterpret_cast<uint8_t*>(new_address);
   ready();
@@ -138,7 +139,7 @@ void* X64Emitter::Emplace(size_t stack_size, GuestFunction* function) {
   return new_address;
 }
 
-bool X64Emitter::Emit(HIRBuilder* builder, size_t* out_stack_size) {
+bool X64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
   Xbyak::Label epilog_label;
   epilog_label_ = &epilog_label;
 
@@ -160,6 +161,16 @@ bool X64Emitter::Emit(HIRBuilder* builder, size_t* out_stack_size) {
   stack_offset -= StackLayout::GUEST_STACK_SIZE;
   stack_offset = xe::align(stack_offset, static_cast<size_t>(16));
 
+  struct _code_offsets {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+
+  code_offsets.prolog = getSize();
+
   // Function prolog.
   // Must be 16b aligned.
   // Windows is very strict about the form of this and the epilog:
@@ -169,10 +180,14 @@ bool X64Emitter::Emit(HIRBuilder* builder, size_t* out_stack_size) {
   //     Adding or changing anything here must be matched!
   const size_t stack_size = StackLayout::GUEST_STACK_SIZE + stack_offset;
   assert_true((stack_size + 8) % 16 == 0);
-  *out_stack_size = stack_size;
+  func_info.stack_size = stack_size;
   stack_size_ = stack_size;
 
   sub(rsp, (uint32_t)stack_size);
+
+  code_offsets.prolog_stack_alloc = getSize();
+  code_offsets.body = getSize();
+
   mov(qword[rsp + StackLayout::GUEST_CTX_HOME], GetContextReg());
   mov(qword[rsp + StackLayout::GUEST_RET_ADDR], rcx);
   mov(qword[rsp + StackLayout::GUEST_CALL_RET_ADDR], 0);
@@ -242,16 +257,30 @@ bool X64Emitter::Emit(HIRBuilder* builder, size_t* out_stack_size) {
   epilog_label_ = nullptr;
   EmitTraceUserCallReturn();
   mov(GetContextReg(), qword[rsp + StackLayout::GUEST_CTX_HOME]);
+
+  code_offsets.epilog = getSize();
+
   add(rsp, (uint32_t)stack_size);
   ret();
 
-  if (FLAGS_emit_source_annotations) {
+  code_offsets.tail = getSize();
+
+  if (cvars::emit_source_annotations) {
     nop();
     nop();
     nop();
     nop();
     nop();
   }
+
+  assert_zero(code_offsets.prolog);
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
 
   return true;
 }
@@ -262,7 +291,7 @@ void X64Emitter::MarkSourceOffset(const Instr* i) {
   entry->hir_offset = uint32_t(i->block->ordinal << 16) | i->ordinal;
   entry->code_offset = static_cast<uint32_t>(getSize());
 
-  if (FLAGS_emit_source_annotations) {
+  if (cvars::emit_source_annotations) {
     nop();
     nop();
     mov(eax, entry->guest_address);
@@ -299,7 +328,7 @@ uint64_t TrapDebugPrint(void* raw_context, uint64_t address) {
   // TODO(benvanik): truncate to length?
   XELOGD("(DebugPrint) %s", str);
 
-  if (FLAGS_enable_debugprint_log) {
+  if (cvars::debugprint_trap_log) {
     debugging::DebugPrint("(DebugPrint) %s", str);
   }
 
@@ -309,7 +338,7 @@ uint64_t TrapDebugPrint(void* raw_context, uint64_t address) {
 uint64_t TrapDebugBreak(void* raw_context, uint64_t address) {
   auto thread_state = *reinterpret_cast<ThreadState**>(raw_context);
   XELOGE("tw/td forced trap hit! This should be a crash!");
-  if (FLAGS_break_on_debugbreak) {
+  if (cvars::break_on_debugbreak) {
     xe::debugging::Break();
   }
   return 0;
@@ -446,7 +475,7 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
 
 uint64_t UndefinedCallExtern(void* raw_context, uint64_t function_ptr) {
   auto function = reinterpret_cast<Function*>(function_ptr);
-  if (!FLAGS_ignore_undefined_externs) {
+  if (!cvars::ignore_undefined_externs) {
     xe::FatalError("undefined extern call to %.8X %s", function->address(),
                    function->name().c_str());
   } else {
@@ -666,7 +695,19 @@ static const vec128_t xmm_consts[] = {
     vec128i(0x3FFu, 0x3FFu << 10, 0x3FFu << 20, 0x3u << 30),
     /* XMMPackUINT_2101010_Shift */ vec128i(0, 10, 20, 30),
     /* XMMUnpackUINT_2101010_Overflow */ vec128i(0x403FFE00u),
-    /* XMMUnpackOverflowNaN   */ vec128i(0x7FC00000u),
+    /* XMMPackULONG_4202020_MinUnpacked */
+    vec128i(0x40380001u, 0x40380001u, 0x40380001u, 0x40400000u),
+    /* XMMPackULONG_4202020_MaxUnpacked */
+    vec128i(0x4047FFFFu, 0x4047FFFFu, 0x4047FFFFu, 0x4040000Fu),
+    /* XMMPackULONG_4202020_MaskUnpacked */
+    vec128i(0xFFFFFu, 0xFFFFFu, 0xFFFFFu, 0xFu),
+    /* XMMPackULONG_4202020_PermuteXZ */
+    vec128i(0xFFFFFFFFu, 0xFFFFFFFFu, 0x0A0908FFu, 0xFF020100u),
+    /* XMMPackULONG_4202020_PermuteYW */
+    vec128i(0xFFFFFFFFu, 0xFFFFFFFFu, 0x0CFFFF06u, 0x0504FFFFu),
+    /* XMMUnpackULONG_4202020_Permute */
+    vec128i(0xFF0E0D0Cu, 0xFF0B0A09u, 0xFF080F0Eu, 0xFFFFFF0Bu),
+    /* XMMUnpackULONG_4202020_Overflow */ vec128i(0x40380000u),
     /* XMMOneOver255          */ vec128f(1.0f / 255.0f),
     /* XMMMaskEvenPI16        */
     vec128i(0x0000FFFFu, 0x0000FFFFu, 0x0000FFFFu, 0x0000FFFFu),
@@ -696,6 +737,7 @@ static const vec128_t xmm_consts[] = {
     /* XMMIntMax              */ vec128i(INT_MAX),
     /* XMMIntMaxPD            */ vec128d(INT_MAX),
     /* XMMPosIntMinPS         */ vec128f((float)0x80000000u),
+    /* XMMQNaN                */ vec128i(0x7FC00000u),
 };
 
 // First location to try and place constants.
@@ -742,6 +784,7 @@ Xbyak::Address X64Emitter::GetXmmConstPtr(XmmConst id) {
                                      sizeof(vec128_t) * id)];
 }
 
+// Implies possible StashXmm(0, ...)!
 void X64Emitter::LoadConstantXmm(Xbyak::Xmm dest, const vec128_t& v) {
   // https://www.agner.org/optimize/optimizing_assembly.pdf
   // 13.4 Generating constants
@@ -802,6 +845,35 @@ Xbyak::Address X64Emitter::StashXmm(int index, const Xbyak::Xmm& r) {
   auto addr = ptr[rsp + kStashOffset + (index * 16)];
   vmovups(addr, r);
   return addr;
+}
+
+Xbyak::Address X64Emitter::StashConstantXmm(int index, float v) {
+  union {
+    float f;
+    uint32_t i;
+  } x = {v};
+  auto addr = rsp + kStashOffset + (index * 16);
+  MovMem64(addr, x.i);
+  MovMem64(addr + 8, 0);
+  return ptr[addr];
+}
+
+Xbyak::Address X64Emitter::StashConstantXmm(int index, double v) {
+  union {
+    double d;
+    uint64_t i;
+  } x = {v};
+  auto addr = rsp + kStashOffset + (index * 16);
+  MovMem64(addr, x.i);
+  MovMem64(addr + 8, 0);
+  return ptr[addr];
+}
+
+Xbyak::Address X64Emitter::StashConstantXmm(int index, const vec128_t& v) {
+  auto addr = rsp + kStashOffset + (index * 16);
+  MovMem64(addr, v.low);
+  MovMem64(addr + 8, v.high);
+  return ptr[addr];
 }
 
 }  // namespace x64

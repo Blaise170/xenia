@@ -14,7 +14,6 @@
 
 #include "third_party/xxhash/xxhash.h"
 
-#include "xenia/gpu/glsl_shader_translator.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/spirv_shader_translator.h"
 #include "xenia/gpu/vulkan/render_cache.h"
@@ -79,7 +78,7 @@ class PipelineCache {
   // state.
   VkPipeline GetPipeline(const RenderState* render_state, uint64_t hash_key);
 
-  bool TranslateShader(VulkanShader* shader, xenos::xe_gpu_program_cntl_t cntl);
+  bool TranslateShader(VulkanShader* shader, reg::SQ_PROGRAM_CNTL cntl);
 
   void DumpShaderDisasmAMD(VkPipeline pipeline);
   void DumpShaderDisasmNV(const VkGraphicsPipelineCreateInfo& info);
@@ -170,7 +169,7 @@ class PipelineCache {
   struct UpdateShaderStagesRegisters {
     PrimitiveType primitive_type;
     uint32_t pa_su_sc_mode_cntl;
-    uint32_t sq_program_cntl;
+    reg::SQ_PROGRAM_CNTL sq_program_cntl;
     VulkanShader* vertex_shader;
     VulkanShader* pixel_shader;
 
@@ -256,7 +255,6 @@ class PipelineCache {
   VkPipelineDepthStencilStateCreateInfo update_depth_stencil_state_info_;
 
   struct UpdateColorBlendStateRegisters {
-    uint32_t rb_colorcontrol;
     uint32_t rb_color_mask;
     uint32_t rb_blendcontrol[4];
     uint32_t rb_modecontrol;
@@ -290,13 +288,13 @@ class PipelineCache {
     float rb_blend_rgba[4];
     uint32_t rb_stencilrefmask;
 
-    uint32_t sq_program_cntl;
+    reg::SQ_PROGRAM_CNTL sq_program_cntl;
     uint32_t sq_context_misc;
     uint32_t rb_colorcontrol;
-    uint32_t rb_color_info;
-    uint32_t rb_color1_info;
-    uint32_t rb_color2_info;
-    uint32_t rb_color3_info;
+    reg::RB_COLOR_INFO rb_color_info;
+    reg::RB_COLOR_INFO rb_color1_info;
+    reg::RB_COLOR_INFO rb_color2_info;
+    reg::RB_COLOR_INFO rb_color3_info;
     float rb_alpha_ref;
     uint32_t pa_su_point_size;
 

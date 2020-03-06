@@ -9,6 +9,7 @@
 
 #include "xenia/base/logging.h"
 #include "xenia/base/memory.h"
+#include "xenia/base/mutex.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -16,6 +17,7 @@
 #include "xenia/kernel/xevent.h"
 #include "xenia/kernel/xfile.h"
 #include "xenia/kernel/xiocompletion.h"
+#include "xenia/kernel/xsymboliclink.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/vfs/device.h"
 #include "xenia/xbox.h"
@@ -90,7 +92,7 @@ dword_result_t NtCreateFile(lpdword_t handle_out, dword_t desired_access,
 
   // Compute path, possibly attrs relative.
   std::string target_path =
-      object_name->to_string(kernel_memory()->virtual_membase());
+      util::TranslateAnsiString(kernel_memory(), object_name);
   if (object_attrs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
       object_attrs->root_directory != 0) {
     auto root_file = kernel_state()->object_table()->LookupObject<XFile>(
@@ -109,7 +111,9 @@ dword_result_t NtCreateFile(lpdword_t handle_out, dword_t desired_access,
   vfs::FileAction file_action;
   X_STATUS result = kernel_state()->file_system()->OpenFile(
       target_path, vfs::FileDisposition((uint32_t)creation_disposition),
-      desired_access, &vfs_file, &file_action);
+      desired_access,
+      (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0, &vfs_file,
+      &file_action);
   object_ref<XFile> file = nullptr;
 
   X_HANDLE handle = X_INVALID_HANDLE_VALUE;
@@ -166,23 +170,15 @@ dword_result_t NtReadFile(dword_t file_handle, dword_t event_handle,
 
   if (XSUCCEEDED(result)) {
     if (true || file->is_synchronous()) {
-      // some games NtReadFile() directly into texture memory
-      // TODO(rick): better checking of physical address
-      if (buffer.guest_address() >= 0xA0000000) {
-        auto heap = kernel_memory()->LookupHeap(buffer.guest_address());
-        cpu::MMIOHandler::global_handler()->InvalidateRange(
-            heap->GetPhysicalAddress(buffer.guest_address()), buffer_length);
-      }
-
       // Synchronous.
-      size_t bytes_read = 0;
+      uint32_t bytes_read = 0;
       result = file->Read(
-          buffer, buffer_length,
+          buffer.guest_address(), buffer_length,
           byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
           &bytes_read, apc_context);
       if (io_status_block) {
         io_status_block->status = result;
-        io_status_block->information = static_cast<uint32_t>(bytes_read);
+        io_status_block->information = bytes_read;
       }
 
       // Queue the APC callback. It must be delivered via the APC mechanism even
@@ -214,7 +210,8 @@ dword_result_t NtReadFile(dword_t file_handle, dword_t event_handle,
       state, file,
       (XAsyncRequest::CompletionCallback)xeNtReadFileCompleted,
       call_state);*/
-      // result = file->Read(buffer, buffer_length, byte_offset, request);
+      // result = file->Read(buffer.guest_address(), buffer_length, byte_offset,
+      //                     request);
       if (io_status_block) {
         io_status_block->status = X_STATUS_PENDING;
         io_status_block->information = 0;
@@ -266,13 +263,13 @@ dword_result_t NtWriteFile(dword_t file_handle, dword_t event_handle,
     // TODO(benvanik): async path.
     if (true || file->is_synchronous()) {
       // Synchronous request.
-      size_t bytes_written = 0;
+      uint32_t bytes_written = 0;
       result = file->Write(
-          buffer, buffer_length,
+          buffer.guest_address(), buffer_length,
           byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
           &bytes_written, apc_context);
       if (XSUCCEEDED(result)) {
-        info = (int32_t)bytes_written;
+        info = bytes_written;
       }
 
       if (!file->is_synchronous()) {
@@ -400,6 +397,9 @@ dword_result_t NtSetInformationFile(
         assert_true(length == 8);
         auto eof = xe::load_and_swap<uint64_t>(file_info);
         result = file->SetLength(eof);
+
+        // Update the files vfs::Entry information
+        file->entry()->update();
         break;
       }
       case XFileCompletionInformation: {
@@ -483,6 +483,11 @@ dword_result_t NtQueryInformationFile(
         // };
         assert_true(length == 56);
 
+        // Make sure we're working with up-to-date information, just in case the
+        // file size has changed via something other than NtSetInfoFile
+        // (eg. seems NtWriteFile might extend the file in some cases)
+        file->entry()->update();
+
         auto file_info = file_info_ptr.as<X_FILE_NETWORK_OPEN_INFORMATION*>();
         file_info->creation_time = file->entry()->create_timestamp();
         file_info->last_access_time = file->entry()->access_timestamp();
@@ -503,10 +508,12 @@ dword_result_t NtQueryInformationFile(
         // XctdDecompression.
         /*
         uint32_t magic;
-        size_t bytes_read;
-        size_t cur_pos = file->position();
+        uint32_t bytes_read;
+        uint64_t cur_pos = file->position();
 
         file->set_position(0);
+        // FIXME(Triang3l): For now, XFile can be read only to guest buffers -
+        // this line won't work, implement reading to host buffers if needed.
         result = file->Read(&magic, sizeof(magic), 0, &bytes_read);
         if (XSUCCEEDED(result)) {
           if (bytes_read == sizeof(magic)) {
@@ -569,7 +576,7 @@ dword_result_t NtQueryFullAttributesFile(
 
   // Resolve the file using the virtual file system.
   auto entry = kernel_state()->file_system()->ResolvePath(
-      object_name->to_string(kernel_memory()->virtual_membase()));
+      util::TranslateAnsiString(kernel_memory(), object_name));
   if (entry) {
     // Found.
     file_info->creation_time = entry->create_timestamp();
@@ -676,8 +683,7 @@ dword_result_t NtQueryDirectoryFile(
   uint32_t info = 0;
 
   auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
-  auto name =
-      file_name ? file_name->to_string(kernel_memory()->virtual_membase()) : "";
+  auto name = util::TranslateAnsiString(kernel_memory(), file_name);
   if (file) {
     X_FILE_DIRECTORY_INFORMATION dir_info = {0};
     result = file->QueryDirectory(file_info_ptr, length,
@@ -715,6 +721,64 @@ dword_result_t NtFlushBuffersFile(
   return result;
 }
 DECLARE_XBOXKRNL_EXPORT1(NtFlushBuffersFile, kFileSystem, kStub);
+
+// https://docs.microsoft.com/en-us/windows/win32/devnotes/ntopensymboliclinkobject
+dword_result_t NtOpenSymbolicLinkObject(
+    lpdword_t handle_out, pointer_t<X_OBJECT_ATTRIBUTES> object_attrs) {
+  if (!object_attrs) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  assert_not_null(handle_out);
+
+  assert_true(object_attrs->attributes == 64);  // case insensitive
+
+  auto object_name =
+      kernel_memory()->TranslateVirtual<X_ANSI_STRING*>(object_attrs->name_ptr);
+
+  std::string target_path =
+      util::TranslateAnsiString(kernel_memory(), object_name);
+  if (object_attrs->root_directory != 0) {
+    assert_always();
+  }
+
+  auto pos = target_path.find("\\??\\");
+  if (pos != target_path.npos && pos == 0) {
+    target_path = target_path.substr(4);  // Strip the full qualifier
+  }
+
+  std::string link_path;
+  if (!kernel_state()->file_system()->FindSymbolicLink(target_path,
+                                                       link_path)) {
+    return X_STATUS_NO_SUCH_FILE;
+  }
+
+  object_ref<XSymbolicLink> symlink(new XSymbolicLink(kernel_state()));
+  symlink->Initialize(target_path, link_path);
+
+  *handle_out = symlink->handle();
+
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(NtOpenSymbolicLinkObject, kFileSystem, kImplemented);
+
+// https://docs.microsoft.com/en-us/windows/win32/devnotes/ntquerysymboliclinkobject
+dword_result_t NtQuerySymbolicLinkObject(dword_t handle,
+                                         pointer_t<X_ANSI_STRING> target) {
+  auto symlink =
+      kernel_state()->object_table()->LookupObject<XSymbolicLink>(handle);
+  if (!symlink) {
+    return X_STATUS_NO_SUCH_FILE;
+  }
+  auto length = std::min(static_cast<size_t>(target->maximum_length),
+                         symlink->target().size());
+  if (length > 0) {
+    auto target_buf = kernel_memory()->TranslateVirtual(target->pointer);
+    std::memcpy(target_buf, symlink->target().c_str(), length);
+  }
+  target->length = static_cast<uint16_t>(length);
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(NtQuerySymbolicLinkObject, kFileSystem, kImplemented);
 
 dword_result_t FscGetCacheElementCount(dword_t r3) { return 0; }
 DECLARE_XBOXKRNL_EXPORT1(FscGetCacheElementCount, kFileSystem, kStub);

@@ -74,8 +74,10 @@ object_ref<T> LookupNamedObject(KernelState* kernel_state,
   if (!obj_attributes_ptr) {
     return nullptr;
   }
-  auto name = X_ANSI_STRING::to_string_indirect(
-      kernel_state->memory()->virtual_membase(), obj_attributes_ptr + 4);
+  auto name = util::TranslateAnsiStringAddress(
+      kernel_state->memory(),
+      xe::load_and_swap<uint32_t>(
+          kernel_state->memory()->TranslateVirtual(obj_attributes_ptr + 4)));
   if (!name.empty()) {
     X_HANDLE handle = X_INVALID_HANDLE_VALUE;
     X_RESULT result =
@@ -136,7 +138,6 @@ dword_result_t ExCreateThread(lpdword_t handle_ptr, dword_t stack_size,
       if (creation_flags & 0x80) {
         *handle_ptr = thread->guest_object();
       } else {
-        thread->RetainHandle();
         *handle_ptr = thread->handle();
       }
     }
@@ -921,6 +922,17 @@ void KeAcquireSpinLockAtRaisedIrql(lpdword_t lock_ptr) {
 }
 DECLARE_XBOXKRNL_EXPORT3(KeAcquireSpinLockAtRaisedIrql, kThreading,
                          kImplemented, kBlocking, kHighFrequency);
+
+dword_result_t KeTryToAcquireSpinLockAtRaisedIrql(lpdword_t lock_ptr) {
+  // Lock.
+  auto lock = reinterpret_cast<uint32_t*>(lock_ptr.host_address());
+  if (!xe::atomic_cas(0, 1, lock)) {
+    return 0;
+  }
+  return 1;
+}
+DECLARE_XBOXKRNL_EXPORT4(KeTryToAcquireSpinLockAtRaisedIrql, kThreading,
+                         kImplemented, kBlocking, kHighFrequency, kSketchy);
 
 void KeReleaseSpinLockFromRaisedIrql(lpdword_t lock_ptr) {
   // Unlock.
